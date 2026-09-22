@@ -442,6 +442,7 @@ pub enum ErrorKind {
     /// This occurs when a return/yield follows a statement that always exits,
     /// such as return, raise, break, or continue.
     Unreachable,
+    UnreachableExceptHandler,
     /// A match case whose pattern can never match the subject type.
     UnreachableMatchCase,
     /// `__all__` is defined but cannot be statically analyzed.

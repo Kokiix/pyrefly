@@ -1114,6 +1114,8 @@ pub enum KeyExpect {
     ValidateImplicitReturn(TextRange),
     /// Reachability of the code following a `with` whose body ended in a jump.
     WithFallthroughReachability(TextRange),
+    /// Except clause reachability check.
+    ExceptHandlerReachability(TextRange),
 }
 
 impl Ranged for KeyExpect {
@@ -1132,7 +1134,8 @@ impl Ranged for KeyExpect {
             | KeyExpect::ForwardRefUnion(range)
             | KeyExpect::ImplicitAliasCheck(range)
             | KeyExpect::ValidateImplicitReturn(range)
-            | KeyExpect::WithFallthroughReachability(range) => *range,
+            | KeyExpect::WithFallthroughReachability(range)
+            | KeyExpect::ExceptHandlerReachability(range) => *range,
         }
     }
 }
@@ -1154,6 +1157,7 @@ impl DisplayWith<ModuleInfo> for KeyExpect {
             KeyExpect::ImplicitAliasCheck(r) => ("ImplicitAliasCheck", r),
             KeyExpect::ValidateImplicitReturn(r) => ("ValidateImplicitReturn", r),
             KeyExpect::WithFallthroughReachability(r) => ("WithFallthroughReachability", r),
+            KeyExpect::ExceptHandlerReachability(r) => ("ExceptClauseReachability", r),
         };
         write!(f, "KeyExpect::{}({})", name, ctx.display(range))
     }
@@ -1245,6 +1249,12 @@ pub enum BindingExpect {
         contexts: Box<[Idx<Key>]>,
         kind: IsAsync,
         /// The code that follows the `with` in its suite.
+        range: TextRange,
+    },
+    /// A try-except handler that may have a base type that has already been handled
+    ExceptHandlerReachability {
+        current_except: Idx<Key>,
+        prev_excepts: Vec<Idx<Key>>,
         range: TextRange,
     },
     /// Track private attribute accesses that need semantic validation.
@@ -1379,6 +1389,18 @@ impl DisplayWith<Bindings> for BindingExpect {
                     "MatchCaseReachability({}, {})",
                     ctx.display(*subject_idx),
                     ctx.module().display(case_range)
+                )
+            }
+            Self::ExceptHandlerReachability {
+                current_except,
+                range,
+                ..
+            } => {
+                write!(
+                    f,
+                    "ExceptHandlerReachability({}, {})",
+                    ctx.display(*current_except),
+                    ctx.module().display(range)
                 )
             }
             Self::WithFallthroughReachability {
