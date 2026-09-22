@@ -575,7 +575,7 @@ def f(x: Any):
 testcase!(
     test_binop_on_any,
     r#"
-from typing import Any, assert_type
+from typing import Any, Self, assert_type
 
 def f(x: Any):
     assert_type(1 + x, Any)
@@ -584,6 +584,14 @@ def f(x: Any):
 def f2(x: int | Any):
     assert_type(1 + x, int | Any)
     assert_type(x < 10,  bool | Any )
+
+class C:
+    def __add__(self, other: object, /) -> Self: ...
+    def __radd__(self, other: object, /) -> Self: ...
+
+def f3(x: C, y: Any) -> None:
+    assert_type(x + y, Any)
+    assert_type(y + x, Any)
     "#,
 );
 
@@ -748,6 +756,24 @@ assert_type(int() if Falsey() else str(), str)
 # legal to use a non-boolable value as the rightmost entry of a bool op.
 assert_type(NotBoolable() or int(), int | NotBoolable)  # E: Expected `__bool__` to be a callable, got `int`
 assert_type(int() or NotBoolable(), int | NotBoolable)
+"#,
+);
+
+testcase!(
+    test_generic_class_bool_context,
+    r#"
+from typing import Generic, TypeVar, assert_type
+
+_T = TypeVar("_T")
+
+class Foo(Generic[_T]):
+    def __bool__(self) -> bool:
+        return False
+
+def f(cls: type[Foo] | None = None):
+    x = cls or Foo
+    assert_type(x, type[Foo])
+    return x
 "#,
 );
 

@@ -6,7 +6,6 @@
  */
 
 use std::iter;
-use std::slice;
 use std::sync::Arc;
 
 use dupe::Dupe;
@@ -19,6 +18,7 @@ use pyrefly_python::sys_info::SysInfo;
 use pyrefly_types::dimension::Int;
 use pyrefly_types::dimension::gradual_size;
 use pyrefly_types::facet::FacetKind;
+use pyrefly_types::identity::IdentityIgnored;
 use pyrefly_types::shaped_array::IntTuple;
 use pyrefly_types::shaped_array::ShapedArrayType;
 use pyrefly_types::type_alias::TypeAliasData;
@@ -286,21 +286,6 @@ impl TypeFormContext<'_> {
         }
     }
 
-    fn can_report_explicit_any(self) -> bool {
-        !matches!(
-            self,
-            TypeFormContext::GenericBase
-                | TypeFormContext::TupleOrCallableParam(_)
-                | TypeFormContext::TupleElement(_)
-                | TypeFormContext::TypeArgument(_)
-                | TypeFormContext::TypeArgumentCallableReturn(_)
-                | TypeFormContext::TypeLevelLambdaReturn(_)
-                | TypeFormContext::TypeArgumentForType(_)
-                | TypeFormContext::TypePredicateArgument(_)
-                | TypeFormContext::UnionMember(_)
-        )
-    }
-
     /// The `UntypeContext` for this type-form position: how a value used here
     /// should be validated. Only a generic base is distinguished; every other
     /// position is treated as an ordinary type.
@@ -322,6 +307,14 @@ pub enum Iterable {
         suffix: Vec<Type>,
     },
     OfTypeVarTuple(Quantified),
+}
+
+/// The results of the two calls to `__exit__` that a `with` can make: one with exception
+/// arguments, taken when the body raised, and one with `None`s, taken when it did not. Both
+/// happen at runtime and both must type-check, but only the first decides suppression.
+struct ContextExit {
+    with_exception: Type,
+    without_exception: Type,
 }
 
 impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
@@ -842,7 +835,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         self.expr_qualifier(&x.value, type_form_context, errors) =>
             {
                 if qualifier == Qualifier::Annotated {
-                    // TODO: we may want to preserve the extra annotation info for `Annotated` in the future
                     if unpacked_slice.len() < 2 {
                         self.error(
                             errors,
@@ -864,6 +856,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     );
                 }
                 let mut ann = self.expr_annotation(&unpacked_slice[0], type_form_context, errors);
+                if qualifier == Qualifier::Annotated {
+                    let metadata: Vec<Type> = unpacked_slice[1..]
+                        .iter()
+                        .map(|e| self.expr_infer(e, &self.error_swallower()))
+                        .collect();
+                    if let Some(inner) = ann.ty.as_ref()
+                        && let Some(dataframe) =
+                            self.polars_dataframe_annotated_type(inner, &metadata)
+                    {
+                        ann.ty = Some(dataframe);
+                    }
+                }
                 if qualifier == Qualifier::ClassVar && ann.get_type().contains_type_variable() {
                     self.error(
                         errors,
@@ -1500,7 +1504,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let ty = if let Some(untyped) = untyped {
             let validated =
                 self.validate_type_form(untyped, range, TypeFormContext::TypeAlias, errors);
-            self.check_explicit_any(&validated, range, errors);
             if validated.is_error() {
                 return TypeAlias::error(name.clone(), style);
             }
@@ -1955,7 +1958,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         range: TextRange,
         errors: &ErrorCollector,
         context: Option<&dyn Fn() -> ErrorContext>,
-    ) -> Type {
+    ) -> ContextExit {
         // Call `__exit__` or `__aexit__` and unwrap the results if async, swallowing any errors from the call itself
         let call_exit = |exit_arg_types, swallow_errors| match kind {
             IsAsync::Sync => self.call_method_or_error(
@@ -2041,7 +2044,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 context,
             );
         }
-        self.union(error_args_result, ok_args_result)
+        ContextExit {
+            with_exception: error_args_result,
+            without_exception: ok_args_result,
+        }
     }
 
     fn context_value(
@@ -2056,8 +2062,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 || ErrorContext::BadContextManager(self.for_display(context_manager_type.clone()));
             let enter_type =
                 self.context_value_enter(context_manager_type, kind, range, errors, Some(&context));
-            let exit_type =
+            let exit =
                 self.context_value_exit(context_manager_type, kind, range, errors, Some(&context));
+            let exit_type = self.union(exit.with_exception, exit.without_exception);
             self.check_type(
                 &exit_type,
                 &self
@@ -2117,9 +2124,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 matches!(ty, Type::Int(_))
                     || matches!(ty, Type::ClassType(cls) if cls.has_qname("shape_extensions", "Int"))
             };
-            let default = if matches!(restriction, Restriction::Flag(_)) {
+            let default = if matches!(
+                &restriction,
+                Restriction::ShapeExtension(extension) if extension.infer_default_as_value()
+            ) {
                 self.expr_infer(default_expr, errors)
-            } else if self.solver().tensor_shapes
+            } else if self.solver().config.tensor_shapes
                 && matches!(&restriction, Restriction::Bound(bound) if is_size_bound(bound))
                 && let Expr::NumberLiteral(ruff_python_ast::ExprNumberLiteral { value, .. }) =
                     default_expr
@@ -2127,6 +2137,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 && let Some(n) = i.as_i64()
             {
                 Type::Int(Int::Literal(n))
+            } else if let Some(default) =
+                self.parse_int_tuple_type_var_default(default_expr, &restriction, errors)
+            {
+                default
             } else {
                 self.expr_untype(
                     default_expr,
@@ -2199,7 +2213,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         source: TParamsSource,
         errors: &ErrorCollector,
     ) -> TParams {
-        self.validate_shape_flag_type_parameter_scope(&tparams, &source, range, errors);
+        self.validate_shape_extension_type_parameter_scope(&tparams, &source, range, errors);
         let mut last_tparam: Option<&Quantified> = None;
         let mut seen: SmallMap<&Name, &Quantified> = SmallMap::new();
         let mut typevartuple = None;
@@ -2328,7 +2342,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         // Inline first-use pinning for NameAssign.
         let mut type_info = if let Binding::NameAssign(na) = binding
-            && self.solver().infer_with_first_use
+            && self.solver().config.infer_with_first_use
             && na.def_idx.is_some()
             && na.annotation.is_none()
             && let FirstUse::UsedBy(first_use_idx) = &na.first_use
@@ -2671,6 +2685,26 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 case_range,
                 errors,
             ),
+            BindingExpect::WithFallthroughReachability {
+                contexts,
+                kind,
+                range,
+            } => {
+                if contexts.iter().all(|context| {
+                    self.context_manager_definitely_does_not_suppress(
+                        self.get_idx(*context).ty(),
+                        *kind,
+                    )
+                }) {
+                    errors
+                        .error_builder(
+                            *range,
+                            ErrorKind::Unreachable,
+                            "This code is unreachable".to_owned(),
+                        )
+                        .emit();
+                }
+            }
             BindingExpect::PrivateAttributeAccess(expectation) => {
                 self.check_private_attribute_access(expectation, errors);
             }
@@ -3434,7 +3468,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if default.is_error() {
             return default.clone();
         }
-        if let Some(default) = self.validate_shape_flag_type_parameter_default(
+        if let Some(default) = self.validate_shape_extension_type_parameter_default(
             name,
             default,
             range,
@@ -3443,71 +3477,75 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         ) {
             return default;
         }
-        match restriction {
+        // A shape extension may apply specialized validation above. Extensions without one use
+        // the same safe fallback as an ordinary bound.
+        let upper_bound = match restriction {
+            Restriction::Bound(bound) => Some(bound.clone()),
+            Restriction::ShapeExtension(extension) => {
+                Some(extension.upper_bound(self.stdlib, self.heap))
+            }
+            Restriction::Constraints(_) | Restriction::Unrestricted => None,
+        };
+        if let Some(bound_ty) = upper_bound {
             // Default must be a subtype of the upper bound.
             // Per PEP 696: when default is a TypeVar, "T1's bound must be a subtype of T2's bound"
-            Restriction::Bound(bound_ty) => {
-                let default_for_check = match default {
-                    Type::TypeVar(tv) => tv.upper_bound(self.stdlib, self.heap),
-                    Type::Quantified(q) if q.is_type_var() => q.upper_bound(self.stdlib, self.heap),
-                    _ => default.clone(),
-                };
-                if !self.is_subset_eq(&default_for_check, bound_ty) {
-                    self.error(
-                        errors,
-                        range,
-                        quantified_error(kind),
-                        format!(
-                            "Expected default `{default}` of `{name}` to be assignable to the upper bound of `{bound_ty}`",
-                        ),
-                    );
-                    return self.heap.mk_any_error();
-                }
+            let default_for_check = match default {
+                Type::TypeVar(tv) => tv.upper_bound(self.stdlib, self.heap),
+                Type::Quantified(q) if q.is_type_var() => q.upper_bound(self.stdlib, self.heap),
+                _ => default.clone(),
+            };
+            if !self.is_subset_eq(&default_for_check, &bound_ty) {
+                self.error(
+                    errors,
+                    range,
+                    quantified_error(kind),
+                    format!(
+                        "Expected default `{default}` of `{name}` to be assignable to the upper bound of `{bound_ty}`",
+                    ),
+                );
+                return self.heap.mk_any_error();
             }
-            Restriction::Constraints(constraints) => {
-                // Per PEP 696: when default is a TypeVar, "the constraints of T2 must be a
-                // superset of the constraints of T1". A bounded or unrestricted TypeVar cannot
-                // be a valid default for a constrained TypeVar since it can't guarantee an
-                // exact constraint match.
-                let valid = match default {
-                    Type::TypeVar(tv) => match tv.restriction() {
-                        Restriction::Constraints(default_constraints) => default_constraints
-                            .iter()
-                            .all(|dc| constraints.iter().any(|c| self.is_consistent(c, dc))),
-                        Restriction::Bound(_)
-                        | Restriction::Flag(_)
-                        | Restriction::Unrestricted => false,
-                    },
-                    Type::Quantified(q) if q.is_type_var() => match q.restriction() {
-                        Restriction::Constraints(default_constraints) => default_constraints
-                            .iter()
-                            .all(|dc| constraints.iter().any(|c| self.is_consistent(c, dc))),
-                        Restriction::Bound(_)
-                        | Restriction::Flag(_)
-                        | Restriction::Unrestricted => false,
-                    },
-                    _ => constraints.iter().any(|c| self.is_consistent(c, default)),
-                };
-                if !valid {
-                    let formatted_constraints = constraints
+        } else if let Restriction::Constraints(constraints) = restriction {
+            // Per PEP 696: when default is a TypeVar, "the constraints of T2 must be a
+            // superset of the constraints of T1". A bounded or unrestricted TypeVar cannot
+            // be a valid default for a constrained TypeVar since it can't guarantee an
+            // exact constraint match.
+            let valid = match default {
+                Type::TypeVar(tv) => match tv.restriction() {
+                    Restriction::Constraints(default_constraints) => default_constraints
                         .iter()
-                        .map(|x| format!("`{x}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    self.error(
-                        errors,
-                        range,
-                        quantified_error(kind),
-                        format!(
-                            "Expected default `{default}` of `{name}` to be one of the following constraints: {formatted_constraints}"
-                        ),
-                    );
-                    return self.heap.mk_any_error();
-                }
+                        .all(|dc| constraints.iter().any(|c| self.is_consistent(c, dc))),
+                    Restriction::Bound(_)
+                    | Restriction::ShapeExtension(_)
+                    | Restriction::Unrestricted => false,
+                },
+                Type::Quantified(q) if q.is_type_var() => match q.restriction() {
+                    Restriction::Constraints(default_constraints) => default_constraints
+                        .iter()
+                        .all(|dc| constraints.iter().any(|c| self.is_consistent(c, dc))),
+                    Restriction::Bound(_)
+                    | Restriction::ShapeExtension(_)
+                    | Restriction::Unrestricted => false,
+                },
+                _ => constraints.iter().any(|c| self.is_consistent(c, default)),
+            };
+            if !valid {
+                let formatted_constraints = constraints
+                    .iter()
+                    .map(|x| format!("`{x}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.error(
+                    errors,
+                    range,
+                    quantified_error(kind),
+                    format!(
+                        "Expected default `{default}` of `{name}` to be one of the following constraints: {formatted_constraints}"
+                    ),
+                );
+                return self.heap.mk_any_error();
             }
-            Restriction::Flag(_) => unreachable!("Flag defaults are validated by the shape layer"),
-            Restriction::Unrestricted => {}
-        };
+        }
         match kind {
             QuantifiedKind::ParamSpec => {
                 if default.is_kind_param_spec() {
@@ -4065,12 +4103,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             if let Some(expr) = &x.expr {
                 self.expr_infer(expr, errors);
             }
-            self.error(
-                errors,
-                x.range,
-                ErrorKind::Unreachable,
-                "This `return` statement is unreachable".to_owned(),
-            )
+            self.heap.mk_never()
         } else if x.is_async && x.is_generator {
             if let Some(expr) = &x.expr {
                 self.expr_infer(expr, errors);
@@ -4152,8 +4185,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
     ) {
         let Some(declared_ty) = hint else { return };
-        let is_object = |t: &Type| matches!(t, Type::ClassType(cls) if cls.is_builtin("object"));
-        if declared_ty.is_any() || is_object(declared_ty) {
+        if declared_ty.is_any() || declared_ty.is_object() {
             return;
         }
         match return_ty {
@@ -4187,17 +4219,49 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// context manager, per
     /// https://typing.python.org/en/latest/spec/exceptions.html#context-managers.
     fn context_manager_suppresses(&self, context_manager_type: &Type, kind: IsAsync) -> bool {
-        let exit = self.context_value_exit(
-            context_manager_type,
-            kind,
-            TextRange::default(),
-            &self.error_swallower(),
-            None,
-        );
+        let exit = self
+            .context_value_exit(
+                context_manager_type,
+                kind,
+                TextRange::default(),
+                &self.error_swallower(),
+                None,
+            )
+            .with_exception;
         match &exit {
             Type::Literal(lit) if let Lit::Bool(b) = lit.value => b,
             Type::ClassType(cls) => cls == self.stdlib.bool(),
             _ => false, // Default to assuming exceptions are not suppressed
+        }
+    }
+
+    /// Whether `__exit__` is known not to suppress exceptions.
+    ///
+    /// This is deliberately not the negation of `context_manager_suppresses`. That predicate
+    /// answers "definitely suppresses" and treats everything it cannot interpret as
+    /// non-suppressing, which is the right default when inferring an implicit return but the
+    /// wrong one for claiming code is dead: a gradual, erroneous, or merely unusual `__exit__`
+    /// would then be read as proof. Here anything we cannot interpret answers `false`, so both
+    /// predicates default to "cannot tell" and a diagnostic never rests on an unread type.
+    fn context_manager_definitely_does_not_suppress(
+        &self,
+        context_manager_type: &Type,
+        kind: IsAsync,
+    ) -> bool {
+        let exit = self
+            .context_value_exit(
+                context_manager_type,
+                kind,
+                TextRange::default(),
+                &self.error_swallower(),
+                None,
+            )
+            .with_exception;
+        match &exit {
+            Type::None => true,
+            Type::Literal(lit) if let Lit::Bool(b) = lit.value => !b,
+            Type::ClassType(cls) => cls == self.stdlib.none_type(),
+            _ => false,
         }
     }
 
@@ -5274,11 +5338,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     /// Whether post-assignment narrowing of `arm[k]` to the assigned value is
     /// sound for this union arm. Defers to the per-class cached
-    /// `KeyClassSubscriptSymmetry` answer for `ClassType` arms; preserves
-    /// today's always-narrow behavior for everything else (TypedDicts,
-    /// tuples, etc.).
+    /// `KeyClassSubscriptSymmetry` answer for `ClassType` arms. `Any` is never narrowed.
     fn subscript_assign_arm_allows_narrowing(&self, arm: &Type) -> bool {
         match arm {
+            Type::Any(_) => false,
             Type::ClassType(cls) => self.get_subscript_symmetry_for_class(cls.class_object()),
             _ => true,
         }
@@ -6613,7 +6676,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }
                     Type::SpecialForm(SpecialForm::TypeForm) => {
                         // Bare TypeForm (no subscript) is equivalent to TypeForm[Any]
-                        Some(Type::TypeForm(Box::new(Type::Any(AnyStyle::Implicit))))
+                        Some(Type::TypeForm(Box::new(Type::any_implicit())))
                     }
                     Type::SpecialForm(SpecialForm::SelfType) => {
                         // `typing.Self` substitutes to the concrete `SelfType` of
@@ -6635,7 +6698,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 let mut aliased_type =
                     self.untype_opt_with_context(ta.as_type(), range, errors, context)?;
                 if let Type::Union(f) = &mut aliased_type {
-                    f.display_name = Some((self.module().name(), (*ta.name).clone()));
+                    f.display_name =
+                        IdentityIgnored(Some((self.module().name(), (*ta.name).clone())));
                 }
                 Some(aliased_type)
             }
@@ -6966,18 +7030,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         ty
     }
 
-    fn check_explicit_any(&self, ty: &Type, range: TextRange, errors: &ErrorCollector) {
-        if ty.any(|ty| matches!(ty, Type::Any(AnyStyle::Explicit))) {
-            errors
-                .error_builder(
-                    range,
-                    ErrorKind::ExplicitAny,
-                    "Explicit `Any` is not allowed".to_owned(),
-                )
-                .emit();
-        }
-    }
-
     /// Type check a delete expression, including ensuring that the target of the
     /// delete is legal.
     fn check_del_statement(&self, delete_target: &Expr, errors: &ErrorCollector) {
@@ -7060,12 +7112,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
     ) -> Type {
         let result = match x {
-            // A `IntVar`'s default (e.g. `N = 3`) is a dimension expression, not
-            // an ordinary type, so route it through the dimension parser.
-            _ if type_form_context == TypeFormContext::IntVarDefault => self
-                .parse_dimension_list(slice::from_ref(x), type_form_context, errors)
-                .and_then(|dims| dims.into_iter().next())
-                .unwrap_or_else(Type::any_error),
+            // An `IntVar` default is a signed integer expression, not an ordinary type.
+            _ if type_form_context == TypeFormContext::IntVarDefault => {
+                self.parse_int_var_argument(x, type_form_context, errors)
+            }
             Expr::List(x)
                 if matches!(
                     type_form_context,
@@ -7090,11 +7140,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
         };
         let result = self.validate_type_form(result, x.range(), type_form_context, errors);
-        let result = self.interpret_map_int_tuples_at_annotation_root(result, type_form_context);
-        if type_form_context.can_report_explicit_any() {
-            self.check_explicit_any(&result, x.range(), errors);
-        }
-        result
+
+        self.interpret_map_int_tuples_at_annotation_root(result, type_form_context)
     }
 
     fn untype_runtime_type(

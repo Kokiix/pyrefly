@@ -167,7 +167,7 @@ pub enum ErrorKind {
     DirectAbstractBaseInstantiation,
     /// Division, floor division, or modulo by a literal zero value.
     DivisionByZero,
-    /// A Polars projection produces more than one column with the same name.
+    /// A Polars operation produces more than one column with the same name.
     DuplicateColumn,
     /// A function has an empty body despite declaring a non-None return type.
     EmptyBody,
@@ -219,7 +219,12 @@ pub enum ErrorKind {
     ImplicitlyDefinedAttribute,
     /// Equality or inequality comparison between incompatible types.
     IncompatibleComparison,
-    /// Overload residual branch pruning left no valid branch for a solved type variable.
+    /// Pruning an overloaded argument's branches left none that accept what the call solved one
+    /// of its type variables to.
+    IncompatibleOverloadArgument,
+    /// DEPRECATED: use [IncompatibleOverloadArgument] (`incompatible-overload-argument`) instead.
+    /// Kept so that existing `# pyrefly: ignore[incompatible-overload-residual]` comments and
+    /// config entries continue to work. This variant is never emitted by the type checker.
     IncompatibleOverloadResidual,
     /// An inconsistency between inherited fields or methods from multiple base classes.
     InconsistentInheritance,
@@ -325,8 +330,12 @@ pub enum ErrorKind {
     /// The SCC fixpoint iteration did not converge within the maximum number of
     /// iterations. The inferred type may be incorrect; adding annotations can help.
     NonConvergentRecursion,
-    /// Matching on an enum without covering all possible cases.
+    /// Matching on a closed type without covering all possible cases.
     NonExhaustiveMatch,
+    /// Matching on an open type without covering all possible cases.
+    /// This is a sub-kind of [NonExhaustiveMatch]: suppressing `non-exhaustive-match` also
+    /// suppresses this error.
+    NonExhaustiveMatchOpenType,
     /// Attempting to use something that isn't a type where a type is expected.
     /// This is a very general error and should be used sparingly.
     NotAType,
@@ -338,7 +347,9 @@ pub enum ErrorKind {
     NotIterable,
     /// Accessing a `NotRequired` TypedDict key without first proving it exists.
     NotRequiredKeyAccess,
-    /// Unpacking an open TypedDict that may contain a bad key via inheritance.
+    /// Unpacking an open TypedDict whose unknown extra items may be incompatible with the
+    /// target: a key with a bad type inherited by a subclass, or an extra keyword argument
+    /// that the callee cannot accept.
     OpenUnpacking,
     /// An error related to parsing or syntax.
     ParseError,
@@ -407,6 +418,10 @@ pub enum ErrorKind {
     UnexpectedPositionalArgument,
     /// Attempting to use a type checker directive without importing it from `typing`.
     UnimportedDirective,
+    /// An instance attribute is declared with a type annotation in the class body but is
+    /// never initialized there or in a recognized method such as `__init__`, so accessing
+    /// it at runtime raises `AttributeError`.
+    UninitializedInstanceVariable,
     /// A call argument whose type is an implicit `Any` (unknown), because the value
     /// passed has an unknown type.
     UnknownArgumentType,
@@ -513,6 +528,7 @@ impl ErrorKind {
             ErrorKind::NoAnyReturnExplicit | ErrorKind::NoAnyReturnImplicit => {
                 Some(ErrorKind::NoAnyReturn)
             }
+            ErrorKind::NonExhaustiveMatchOpenType => Some(ErrorKind::NonExhaustiveMatch),
             ErrorKind::PytorchEfficiencyLintCudaCall
             | ErrorKind::PytorchEfficiencyLintItemCall
             | ErrorKind::PytorchEfficiencyLintPrintTensor
@@ -528,6 +544,9 @@ impl ErrorKind {
     pub fn deprecated_alias(self) -> Option<ErrorKind> {
         match self {
             ErrorKind::BadOverrideParamName => Some(ErrorKind::BadParamNameOverride),
+            ErrorKind::IncompatibleOverloadArgument => {
+                Some(ErrorKind::IncompatibleOverloadResidual)
+            }
             ErrorKind::ImplicitAnyAttribute => Some(ErrorKind::UnannotatedAttribute),
             ErrorKind::ImplicitAnyParameter => Some(ErrorKind::UnannotatedParameter),
             _ => None,
@@ -576,6 +595,7 @@ impl ErrorKind {
             ErrorKind::NoAnyReturnExplicit => Severity::Ignore,
             ErrorKind::NoAnyReturnImplicit => Severity::Ignore,
             ErrorKind::NonExhaustiveMatch => Severity::Warn,
+            ErrorKind::NonExhaustiveMatchOpenType => Severity::Ignore,
             ErrorKind::NonConvergentRecursion => Severity::Warn,
             ErrorKind::NotRequiredKeyAccess => Severity::Ignore,
             ErrorKind::OpenUnpacking => Severity::Ignore,
@@ -591,6 +611,7 @@ impl ErrorKind {
             ErrorKind::UnannotatedAttribute => Severity::Ignore,
             ErrorKind::UnannotatedParameter => Severity::Ignore,
             ErrorKind::UnannotatedReturn => Severity::Ignore,
+            ErrorKind::UninitializedInstanceVariable => Severity::Ignore,
             ErrorKind::UnknownArgumentType => Severity::Ignore,
             ErrorKind::ImplicitAnyLambda => Severity::Ignore,
             ErrorKind::UnknownAttributeType => Severity::Ignore,
@@ -622,11 +643,18 @@ impl ErrorKind {
         matches!(self, ErrorKind::RevealType)
     }
 
+    /// Returns true if this error kind reports a suppression comment that
+    /// suppresses nothing, covering both Pyrefly/Pyre ignores and
+    /// `# type: ignore`.
+    pub fn is_unused_ignore(self) -> bool {
+        matches!(self, ErrorKind::UnusedIgnore | ErrorKind::UnusedTypeIgnore)
+    }
+
     /// Returns whether `--suppress-errors` may write a suppression comment for
-    /// this kind. Unused-ignore diagnostics are excluded because suppressing one
-    /// would only leave behind another unused ignore.
+    /// this kind. Directives are not errors, and suppressing an unused-ignore
+    /// diagnostic would only leave behind another unused ignore.
     pub fn is_suppressable(self) -> bool {
-        !matches!(self, ErrorKind::UnusedIgnore | ErrorKind::UnusedTypeIgnore)
+        !self.is_directive() && !self.is_unused_ignore()
     }
 
     /// A soft error is a diagnostic that should not influence overload selection
@@ -697,6 +725,14 @@ mod tests {
             ErrorKind::DuplicateColumn.default_severity(),
             Severity::Error
         );
+    }
+
+    #[test]
+    fn test_suppressable_excludes_directives_and_unused_ignores() {
+        assert!(!ErrorKind::RevealType.is_suppressable());
+        assert!(!ErrorKind::UnusedIgnore.is_suppressable());
+        assert!(!ErrorKind::UnusedTypeIgnore.is_suppressable());
+        assert!(ErrorKind::BadAssignment.is_suppressable());
     }
 
     #[test]

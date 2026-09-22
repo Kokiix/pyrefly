@@ -100,6 +100,8 @@ use crate::export::exports::LookupExport;
 use crate::module::module_info::ModuleInfo;
 use crate::solver::solver::CallContext;
 use crate::solver::solver::PinError;
+#[cfg(test)]
+use crate::solver::solver::Solver;
 use crate::solver::solver::SubsetError;
 use crate::solver::solver::VarRecurser;
 use crate::solver::type_order::TypeOrder;
@@ -114,8 +116,8 @@ use crate::types::types::Var;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum JaxtypingQuantifiedKey {
-    Dim(Name, QuantifiedKind),
-    ShapeCarrier(Name, QuantifiedKind),
+    Dimension(Name, QuantifiedKind),
+    VariadicShape(Name, QuantifiedKind),
 }
 
 pub struct TypeCheckOptions<'a, 'subset> {
@@ -148,15 +150,15 @@ impl<'a, 'subset> TypeCheckOptions<'a, 'subset> {
 /// Compactly represents the identity of a binding, for the purposes of
 /// understanding the calculation stack.
 #[derive(Clone, Dupe)]
-pub struct CalcId(pub Bindings, pub AnyIdx);
+pub struct CalcId(pub Arc<Answers>, pub AnyIdx);
 
 impl Debug for CalcId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "CalcId({}, {}, {:?})",
-            self.0.module().name(),
-            self.0.module().path(),
+            self.bindings().module().name(),
+            self.bindings().module().path(),
             self.1,
         )
     }
@@ -167,17 +169,24 @@ impl Display for CalcId {
         write!(
             f,
             "CalcId({}, {}, {})",
-            self.0.module().name(),
-            self.0.module().path(),
-            self.1.display_with(&self.0),
+            self.bindings().module().name(),
+            self.bindings().module().path(),
+            self.1.display_with(self.bindings()),
         )
     }
 }
 
 impl PartialEq for CalcId {
     fn eq(&self, other: &Self) -> bool {
-        (self.0.module().name(), self.0.module().path(), &self.1)
-            == (other.0.module().name(), other.0.module().path(), &other.1)
+        (
+            self.bindings().module().name(),
+            self.bindings().module().path(),
+            &self.1,
+        ) == (
+            other.bindings().module().name(),
+            other.bindings().module().path(),
+            &other.1,
+        )
     }
 }
 
@@ -186,8 +195,17 @@ impl Eq for CalcId {}
 impl Ord for CalcId {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.1.cmp(&other.1) {
-            Ordering::Equal => match self.0.module().name().cmp(&other.0.module().name()) {
-                Ordering::Equal => self.0.module().path().cmp(other.0.module().path()),
+            Ordering::Equal => match self
+                .bindings()
+                .module()
+                .name()
+                .cmp(&other.bindings().module().name())
+            {
+                Ordering::Equal => self
+                    .bindings()
+                    .module()
+                    .path()
+                    .cmp(other.bindings().module().path()),
                 not_equal => not_equal,
             },
             not_equal => not_equal,
@@ -203,13 +221,17 @@ impl PartialOrd for CalcId {
 
 impl Hash for CalcId {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.module().name().hash(state);
-        self.0.module().path().hash(state);
+        self.bindings().module().name().hash(state);
+        self.bindings().module().path().hash(state);
         self.1.hash(state);
     }
 }
 
 impl CalcId {
+    pub(crate) fn bindings(&self) -> &Bindings {
+        self.0.bindings()
+    }
+
     /// Create a CalcId for testing purposes.
     ///
     /// The `module_name` creates a distinguishable module, and `idx` creates
@@ -219,11 +241,16 @@ impl CalcId {
     pub fn for_test(module_name: &str, idx: usize) -> Self {
         use pyrefly_graph::index::Idx;
 
-        let bindings = Bindings::for_test(module_name);
+        let answers = Arc::new(Answers::new(
+            Bindings::for_test(module_name),
+            Solver::new(Default::default()),
+            false,
+            false,
+        ));
         // Create a fake Key index - the actual key doesn't matter for test purposes,
         // only that different idx values produce different CalcIds
         let key_idx: Idx<Key> = Idx::new(idx);
-        CalcId(bindings, AnyIdx::Key(key_idx))
+        CalcId(answers, AnyIdx::Key(key_idx))
     }
 }
 
@@ -286,7 +313,7 @@ impl<'a> GenerationAnswer<'a> {
 }
 
 pub(crate) enum AnswerProvider {
-    Answers(Arc<(Bindings, Arc<Answers>)>),
+    Answers(Arc<Answers>),
     Solutions(Arc<Solutions>),
 }
 
@@ -662,9 +689,9 @@ impl CalcStack {
                 }
                 // The target is now in the top SCC's iteration state.
                 // Determine the appropriate action based on iteration state.
-                // After merge, existing iteration states are preserved (Done/
-                // InProgress stay as-is) and new members are Fresh. The target
-                // will typically be Fresh or InProgress. Handle all cases.
+                // After merge, existing iteration states retain their
+                // advancement and members absorbed from the live stack are
+                // InProgress.
                 guard.action = self.binding_action_for_top_scc_member(answer_scope, current);
                 return guard;
             }
@@ -1348,30 +1375,17 @@ impl CalcStack {
         scc_stack.pop()
     }
 
-    /// Removes a CalcId from the top SCC's `node_state`.
-    ///
-    /// Used when `drive_member` was a no-op (e.g., the target module's
-    /// Answers were evicted by another thread). Removing the member from
-    /// node state prevents `next_fresh_member` from returning it
-    /// again, breaking what would otherwise be an infinite loop.
-    ///
-    /// If a merge or iteration restart rebuilds node states, the member
-    /// may be re-added as Fresh and re-detected on the next drive loop
-    /// (which is harmless — the eviction is persistent, so the member
-    /// is immediately removed again).
-    fn remove_from_iteration_state(&self, calc_id: &CalcId) {
+    /// Remove a Fresh member whose iterative drive returned before starting it.
+    fn remove_unstarted_iteration_member(&self, calc_id: &CalcId) {
         let mut scc_stack = self.scc_stack.borrow_mut();
-        if let Some(scc) = scc_stack.last_mut() {
-            scc.node_state.remove(calc_id);
-        } else {
-            // TODO(stroxler): Consider panicking here once we're confident this
-            // path is unreachable in the LSP. The silent no-op may mask bugs.
-            debug_assert!(
-                false,
-                "remove_from_iteration_state: no iterating SCC on the stack for {:?}",
-                calc_id
-            );
-        }
+        let top_scc = scc_stack
+            .last_mut()
+            .expect("no iterating SCC for a Fresh member after a no-op drive");
+        let removed = top_scc.node_state.remove(calc_id);
+        debug_assert!(
+            matches!(removed, Some(SccNodeState::Fresh)),
+            "only a Fresh SCC member may remain after a no-op drive",
+        );
     }
 }
 
@@ -1387,9 +1401,9 @@ impl CalcStack {
 /// The `advancement_rank()` method encodes this ordering for use during SCC merge.
 #[derive(Debug, Clone)]
 pub enum SccNodeState {
-    /// Node hasn't been processed yet as part of SCC handling.
+    /// Node is queued for the iterative driver and has no live calculation.
     Fresh,
-    /// Node is currently being processed (on the Rust call stack).
+    /// Node has a live calculation on the Rust call stack.
     InProgress,
     /// A placeholder has been recorded in SCC-local state for cycle breaking,
     /// but we haven't computed the real answer yet.
@@ -1598,11 +1612,12 @@ impl Scc {
     fn new(raw: Vec1<CalcId>, calc_stack_vec: &[CalcId], owner: SccOwner) -> Self {
         let detected_at = raw.first().dupe();
 
-        // Initialize all nodes as Fresh
+        // `raw` comes directly from the active calculation stack, so every
+        // newly detected cycle member already has a live frame.
         let node_state: BTreeMap<CalcId, SccNodeState> = raw
             .iter()
             .duped()
-            .map(|c| (c, SccNodeState::Fresh))
+            .map(|c| (c, SccNodeState::InProgress))
             .collect();
 
         // The anchor is the detected_at CalcId (the one pushed twice, triggering cycle
@@ -2057,24 +2072,23 @@ fn check_demotion_limit(demotions: u32, scc_identity: &CalcId) {
 /// the two lets one lifetime describe a borrow of either.
 pub struct AnswersSolver<'ctx, 'answer, Ans: LookupAnswer> {
     answers: &'ctx Ans,
-    current: &'answer Answers,
+    current: &'answer Arc<Answers>,
     thread_state: &'answer ThreadState,
     answer_scope: &'answer AnswerScope,
     // The base solver is only used to reset the error collector at binding
     // boundaries. Answers code should generally use the error collector passed
     // along the call stack instead.
     base_errors: &'ctx ErrorCollector,
-    bindings: &'answer Bindings,
     pub exports: &'ctx dyn LookupExport,
     pub uniques: &'ctx UniqueFactory,
     pub recurser: &'ctx VarRecurser,
     pub stdlib: &'ctx Stdlib,
     pub heap: &'ctx TypeHeap,
     /// Cache for jaxtyping synthetic quantifieds.
-    /// Module-scoped: the same dimension key always maps to the same Quantified,
+    /// Module-scoped: the same key always maps to the same Quantified,
     /// which is correct because each function independently wraps its signature
     /// in a Forall (just like legacy TypeVars defined at module scope).
-    jaxtyping_dims: &'ctx RefCell<FxHashMap<JaxtypingQuantifiedKey, Quantified>>,
+    jaxtyping_quantifieds: &'ctx RefCell<FxHashMap<JaxtypingQuantifiedKey, Quantified>>,
 }
 
 /// Proof that this SCC owns the pending result slot for this calculation.
@@ -2145,9 +2159,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     pub(crate) fn new(
         answers: &'ctx Ans,
-        current: &'answer Answers,
+        current: &'answer Arc<Answers>,
         base_errors: &'ctx ErrorCollector,
-        bindings: &'answer Bindings,
         exports: &'ctx dyn LookupExport,
         uniques: &'ctx UniqueFactory,
         recurser: &'ctx VarRecurser,
@@ -2155,13 +2168,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         thread_state: &'answer ThreadState,
         answer_scope: &'answer AnswerScope,
         heap: &'ctx TypeHeap,
-        jaxtyping_dims: &'ctx RefCell<FxHashMap<JaxtypingQuantifiedKey, Quantified>>,
+        jaxtyping_quantifieds: &'ctx RefCell<FxHashMap<JaxtypingQuantifiedKey, Quantified>>,
     ) -> AnswersSolver<'ctx, 'answer, Ans> {
         AnswersSolver {
             stdlib,
             uniques,
             answers,
-            bindings,
             base_errors,
             exports,
             recurser,
@@ -2169,7 +2181,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             thread_state,
             answer_scope,
             heap,
-            jaxtyping_dims,
+            jaxtyping_quantifieds,
         }
     }
 
@@ -2184,13 +2196,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             thread_state: self.thread_state,
             answer_scope,
             base_errors: self.base_errors,
-            bindings: self.bindings,
             exports: self.exports,
             uniques: self.uniques,
             recurser: self.recurser,
             stdlib: self.stdlib,
             heap: self.heap,
-            jaxtyping_dims: self.jaxtyping_dims,
+            jaxtyping_quantifieds: self.jaxtyping_quantifieds,
         }
     }
 
@@ -2208,14 +2219,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// Get or create a Quantified type for a jaxtyping dimension name.
     /// Cached per module on the `(name, kind)` pair: the same name reused with a
     /// different `QuantifiedKind` intentionally yields a distinct Quantified.
-    pub fn get_or_create_jaxtyping_dim(&self, name: Name, kind: QuantifiedKind) -> Quantified {
-        let mut dims = self.jaxtyping_dims.borrow_mut();
-        // Jaxtyping dims have no real source location. Use the current map size as a
+    pub fn get_or_create_jaxtyping_dimension(
+        &self,
+        name: Name,
+        kind: QuantifiedKind,
+    ) -> Quantified {
+        let mut quantifieds = self.jaxtyping_quantifieds.borrow_mut();
+        // Jaxtyping dimensions have no real source location. Use the current map size as a
         // collision-free ordinal to distinguish synthetic quantifieds at the same
-        // (default) anchor. Shared with `get_or_create_jaxtyping_shape_carrier`, which
+        // (default) anchor. Shared with `get_or_create_jaxtyping_variadic_shape`, which
         // uses the same map, so ordinals stay unique across both.
-        let ordinal = dims.len() as u32;
-        dims.entry(JaxtypingQuantifiedKey::Dim(name.clone(), kind))
+        let ordinal = quantifieds.len() as u32;
+        quantifieds
+            .entry(JaxtypingQuantifiedKey::Dimension(name.clone(), kind))
             .or_insert_with(|| {
                 let identity = QuantifiedIdentity::new(
                     self.module().name(),
@@ -2242,20 +2258,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .clone()
     }
 
-    /// Get or create a tuple-carrier TypeVar or IntVar for a jaxtyping variadic shape name.
+    /// Get or create a TypeVar or IntVar for a jaxtyping variadic shape name.
     ///
     /// A variadic jaxtyping shape (`*name`) whose enclosing shaped-array class uses a
-    /// `TypeVar`/`IntVar` (IntTuple) shape parameter needs a carrier bounded by
+    /// `TypeVar`/`IntVar` (`IntTuple`) shape parameter needs a quantified bounded by
     /// `tuple[int, ...]`, rather than the `TypeVarTuple` produced for `*Shape` classes.
-    pub fn get_or_create_jaxtyping_shape_carrier(
+    pub fn get_or_create_jaxtyping_variadic_shape(
         &self,
         name: Name,
         kind: QuantifiedKind,
     ) -> Quantified {
-        let mut dims = self.jaxtyping_dims.borrow_mut();
-        // See `get_or_create_jaxtyping_dim`: the shared map's size is a collision-free ordinal.
-        let ordinal = dims.len() as u32;
-        dims.entry(JaxtypingQuantifiedKey::ShapeCarrier(name.clone(), kind))
+        let mut quantifieds = self.jaxtyping_quantifieds.borrow_mut();
+        // See `get_or_create_jaxtyping_dimension`: the shared map's size is a collision-free
+        // ordinal.
+        let ordinal = quantifieds.len() as u32;
+        quantifieds
+            .entry(JaxtypingQuantifiedKey::VariadicShape(name.clone(), kind))
             .or_insert_with(|| {
                 let identity = QuantifiedIdentity::new(
                     self.module().name(),
@@ -2274,16 +2292,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         PreInferenceVariance::Invariant,
                     ),
                     QuantifiedKind::TypeVarTuple | QuantifiedKind::ParamSpec => {
-                        unreachable!("jaxtyping shape carriers must be TypeVar or IntVar")
+                        unreachable!("jaxtyping variadic shapes must be TypeVar or IntVar")
                     }
                 }
             })
             .clone()
     }
 
-    /// Check if a Quantified type was created by jaxtyping dimension parsing.
-    pub fn is_jaxtyping_dim(&self, q: &Quantified) -> bool {
-        self.jaxtyping_dims.borrow().values().any(|v| v == q)
+    /// Check if a quantified type was created while parsing a jaxtyping shape.
+    pub fn is_jaxtyping_quantified(&self, q: &Quantified) -> bool {
+        self.jaxtyping_quantifieds.borrow().values().any(|v| v == q)
     }
 
     pub fn current(&self) -> &'answer Answers {
@@ -2291,7 +2309,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     pub fn bindings(&self) -> &'answer Bindings {
-        self.bindings
+        self.current.bindings()
     }
 
     pub fn base_errors(&self) -> &ErrorCollector {
@@ -2299,7 +2317,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     pub fn module(&self) -> &ModuleInfo {
-        self.bindings.module()
+        self.bindings().module()
     }
 
     /// Look up the fields of a class from binding metadata.
@@ -2313,7 +2331,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// same-module indices are always valid).
     pub fn get_class_fields(&self, cls: &Class) -> Option<&ClassFields> {
         if cls.module_path() == self.module().path() {
-            return Some(&self.bindings.metadata().get_class(cls.index()).fields);
+            return Some(&self.bindings().metadata().get_class(cls.index()).fields);
         }
         self.answers.get_class_fields(cls)
     }
@@ -2547,7 +2565,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return (v, true);
         }
 
-        let current = CalcId(self.bindings().dupe(), K::to_anyidx(idx));
+        let current = CalcId(self.current.dupe(), K::to_anyidx(idx));
 
         // Check depth limit before any calculation
         let borrowed = if let Some(config) = self.recursion_limit_config()
@@ -2942,7 +2960,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     /// Returns true if the cell is same-module.
     fn is_same_module(&self, calc_id: &CalcId) -> bool {
-        let CalcId(ref bindings, _) = *calc_id;
+        let bindings = calc_id.bindings();
         bindings.module().name() == self.bindings().module().name()
             && bindings.module().path() == self.bindings().module().path()
     }
@@ -3120,14 +3138,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     /// Drive a single iteration member by calling `get_idx` for its typed index.
     ///
-    /// The member is a `CalcId` containing `(Bindings, AnyIdx)`. For same-module
+    /// The member is a `CalcId` containing `(Answers, AnyIdx)`. For same-module
     /// members (where the member's module matches this solver's module), we
     /// dispatch through `dispatch_anyidx!` to call `get_idx` with the concrete
     /// key type. Cross-module members are driven via `solve_idx_erased`, which
     /// constructs a temporary `AnswersSolver` in the target module's context
     /// using the shared `ThreadState` (and therefore the shared `CalcStack`).
     fn drive_member(&self, calc_id: &CalcId) {
-        let CalcId(ref bindings, ref any_idx) = *calc_id;
+        let any_idx = &calc_id.1;
+        let bindings = calc_id.bindings();
         if bindings.module().name() != self.bindings().module().name()
             || bindings.module().path() != self.bindings().module().path()
         {
@@ -3184,16 +3203,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     fn drive_all_iteration_members(&self) {
         while let Some(id) = self.stack().next_fresh_member() {
             self.drive_member(&id);
-            // If the member is still Fresh after driving, the drive was a
-            // no-op. This happens when solve_idx_erased encounters an
-            // Evicted module (another thread ran Solutions and freed
-            // Answers). The member's answer is already committed globally,
-            // so remove it from iteration state to prevent infinite looping.
+            // If the member is still Fresh after driving, the drive returned
+            // before pushing a calculation frame. Since live members are
+            // InProgress by construction, this member cannot complete locally.
             if matches!(
                 self.stack().get_iteration_node_state(&id),
                 Some(SccNodeStateKind::Fresh)
             ) {
-                self.stack().remove_from_iteration_state(&id);
+                self.stack().remove_unstarted_iteration_member(&id);
             }
         }
     }
@@ -3321,7 +3338,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     Self::emit_non_convergent_diagnostic(diagnostic, self.base_errors);
                 } else {
                     let cross_errors = ErrorCollector::new(
-                        diagnostic.calc_id.0.module().dupe(),
+                        diagnostic.calc_id.bindings().module().dupe(),
                         ErrorStyle::Delayed,
                     );
                     Self::emit_non_convergent_diagnostic(diagnostic, &cross_errors);
@@ -3673,13 +3690,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
             TypeCheckCallContext::NoCall => None,
         };
-        let flag_source_context =
-            call_context.and_then(|context| context.for_shape_flag_binding_source(want));
+        let extension_source_context =
+            call_context.and_then(|context| context.for_shape_extension_binding_source(want));
         let subset_result = self.solver().is_subset_eq(
             got,
             want,
             self.type_order(),
-            flag_source_context.as_ref().or(call_context),
+            extension_source_context.as_ref().or(call_context),
         );
         match subset_result {
             Ok(()) => {
@@ -4008,7 +4025,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// answer changed in the final iteration. Called via `dispatch_anyidx!`
     /// so that the concrete `K` (and therefore `K::Answer`) is known.
     ///
-    /// `member_bindings` and `member_errors` must come from the member's own
+    /// `member_answers` must come from the member's own
     /// module, not necessarily `self`. SCCs can span modules, so `self.bindings()`
     /// and `self.base_errors` are only correct for same-module members.
     ///
@@ -4023,7 +4040,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         idx: Idx<K>,
         current: &AnyAnswer,
         previous: Option<&AnyAnswer>,
-        member_bindings: &Bindings,
+        member_answers: &Arc<Answers>,
     ) -> Option<NonConvergentDiagnostic>
     where
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
@@ -4031,6 +4048,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         K::Answer: Debug,
         K::Value: Debug,
     {
+        let member_bindings = member_answers.bindings();
+
         // Only report if the answer actually changed from the previous iteration.
         if let Some(prev) = previous
             && self.answers_equal_typed::<K>(idx, prev, current)
@@ -4086,7 +4105,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             None
         };
         Some(NonConvergentDiagnostic {
-            calc_id: CalcId(member_bindings.dupe(), K::to_anyidx(idx)),
+            calc_id: CalcId(member_answers.dupe(), K::to_anyidx(idx)),
             range: K::range_with(idx, member_bindings),
             message,
             details,
@@ -4237,6 +4256,73 @@ mod scc_tests {
             .pop_and_take_completed_scc()
             .expect("caller completion should release the SCC");
         assert_eq!(completed.start_driver(), SccDriver(0));
+    }
+
+    //   Driver / CalcStack                         Publisher
+    //   [caller, member]
+    //       member requests caller
+    //   [caller, member, caller]
+    //       detect and expand SCC
+    //                                              publish caller's answer
+    //       shared-answer hit; no placeholder
+    //   [caller], caller: InProgress
+    //       Driver ──> Caller ──> complete SCC
+    //
+    // If expansion marks the live caller Fresh, the driver's later shared-answer
+    // hit removes it as unstarted work and leaves the Caller-owned SCC orphaned.
+    #[test]
+    fn test_published_answer_during_cycle_expansion_preserves_live_caller() {
+        let caller = CalcId::for_test("m", 0);
+        let member = CalcId::for_test("m", 1);
+        let calc_stack = make_calc_stack(&[caller.dupe()]);
+        let mut scc = make_test_scc(fresh_nodes(&[member.dupe()]), member.dupe(), 1);
+        scc.iterative.iteration = 1;
+        scc.owner = SccOwner::Driver(0);
+        calc_stack.push_scc(scc);
+        calc_stack.next_scc_owner.set(1);
+
+        let answer_scope = AnswerScope::new();
+        let member_frame = calc_stack.push(&answer_scope, &member);
+        assert!(matches!(member_frame.action(), BindingAction::Calculate));
+
+        let recursive_frame = calc_stack.push(&answer_scope, &caller);
+        assert!(matches!(
+            recursive_frame.action(),
+            BindingAction::NeedsColdPlaceholder
+        ));
+        // A shared-answer hit returns without recording a placeholder.
+        assert!(recursive_frame.finish().is_none());
+
+        let answer = AnyAnswer::new::<Key>(AnswerBox::new(test_answer(42)));
+        calc_stack.set_iteration_node_done(&answer_scope, &member, answer, None, None);
+        assert!(member_frame.finish().is_none());
+
+        // Model the same shared-answer hit when the driver visits remaining work.
+        let unstarted = calc_stack.next_fresh_member();
+        if let Some(unstarted) = &unstarted {
+            assert_eq!(unstarted, &caller);
+            calc_stack.remove_unstarted_iteration_member(unstarted);
+        }
+        assert!(calc_stack.take_top_scc_for_driver(SccDriver(0)).is_none());
+        assert_eq!(calc_stack.scc_stack.borrow()[0].owner, SccOwner::Caller(0));
+
+        let caller_is_participant = calc_stack.is_scc_participant(&caller);
+        if caller_is_participant {
+            let answer = AnyAnswer::new::<Key>(AnswerBox::new(test_answer(43)));
+            calc_stack.on_calculation_finished(&answer_scope, &caller, answer, None, None);
+        }
+        let completed = calc_stack.pop_and_take_completed_scc();
+        assert!(
+            unstarted.is_none(),
+            "the live caller must not be queued as Fresh work",
+        );
+        assert!(
+            caller_is_participant,
+            "the expanded SCC must retain its live caller",
+        );
+        let mut completed = completed.expect("caller completion should release the expanded SCC");
+        assert_eq!(completed.start_driver(), SccDriver(0));
+        assert!(calc_stack.sccs_is_empty());
     }
 
     #[test]

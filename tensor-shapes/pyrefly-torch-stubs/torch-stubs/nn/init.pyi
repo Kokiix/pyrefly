@@ -12,7 +12,7 @@ tensor's shape and return the same tensor. They use the Tensor[Shape] pattern
 to maintain shape information through initialization calls.
 """
 
-from typing import Literal
+from typing import Any, Literal, overload
 
 from shape_extensions import IntTuple
 from torch import Tensor
@@ -117,6 +117,7 @@ def sparse_[Shape: IntTuple](
     ...
 
 # Truncated normal initialization
+@overload
 def trunc_normal_[Shape: IntTuple](
     tensor: Tensor[Shape],
     mean: float = 0.0,
@@ -126,3 +127,29 @@ def trunc_normal_[Shape: IntTuple](
 ) -> Tensor[Shape]:
     """Fill tensor with truncated normal distribution."""
     ...
+
+@overload
+def trunc_normal_(
+    tensor: Tensor,
+    mean: float = 0.0,
+    std: float = 1.0,
+    a: float = -2.0,
+    b: float = 2.0,
+) -> Tensor: ...
+
+# Deprecated aliases preserve the shape-aware signatures above.
+constant = constant_
+eye = eye_
+kaiming_normal = kaiming_normal_
+kaiming_uniform = kaiming_uniform_
+normal = normal_
+orthogonal = orthogonal_
+sparse = sparse_
+uniform = uniform_
+xavier_normal = xavier_normal_
+xavier_uniform = xavier_uniform_
+
+# TODO: Add precise signatures for the remaining public API.
+calculate_gain: Any
+dirac: Any
+dirac_: Any

@@ -79,9 +79,11 @@ use crate::config::error_kind::ErrorKind;
 use crate::error::suppress::detect_line_ending;
 use crate::export::exports::Export;
 use crate::export::exports::ExportLocation;
+use crate::export::exports::Exports;
 use crate::lsp::module_helpers::collect_symbol_def_paths;
 use crate::lsp::wasm::completion::CompletionOptions;
 use crate::lsp::wasm::signature_help::CallInfo;
+use crate::module::finder::ImportReplacementPolicy;
 use crate::state::ide::ImportEdit;
 use crate::state::ide::IntermediateDefinition;
 use crate::state::ide::common_alias_target_module;
@@ -276,6 +278,8 @@ pub struct FindPreference {
     /// when callers need the raw definition (e.g., call-graph queries that
     /// unwrap decorators like `@lru_cache`).
     pub resolve_call_dunders: bool,
+    /// Controls whether import lookup can include modules matched by `replace-imports-with-any`.
+    pub(crate) replacement_policy: ImportReplacementPolicy,
     /// When true, disable the LSP style fallback behavior. Normally, if a
     /// symbol is not found in the preferred file style (e.g., `.pyi`), the LSP
     /// will fall back to the other style (e.g., `.py`) and look for the same
@@ -291,6 +295,7 @@ impl Default for FindPreference {
             import_behavior: ImportBehavior::JumpThroughEverything,
             prefer_pyi: true,
             resolve_call_dunders: true,
+            replacement_policy: ImportReplacementPolicy::Respect,
             disable_style_fallback: false,
         }
     }
@@ -831,65 +836,36 @@ impl<'a> Transaction<'a> {
         )
     }
 
-    fn get_type_for_surface(&self, handle: &Handle, key: &Key, for_display: bool) -> Option<Type> {
-        let idx = self.get_bindings(handle)?.key_to_idx(key);
+    fn get_type_for_surface(&self, handle: &Handle, key: &Key) -> Option<Type> {
         let answers = self.get_answers(handle)?;
-        if for_display {
-            answers.get_type_at_for_display(idx)
-        } else {
-            answers.get_type_at(idx)
-        }
+        let idx = answers.bindings().key_to_idx(key);
+        answers.get_type_at(idx)
     }
 
     pub fn get_type(&self, handle: &Handle, key: &Key) -> Option<Type> {
-        self.get_type_for_surface(handle, key, false)
+        self.get_type_for_surface(handle, key)
     }
 
-    pub fn get_type_for_display(&self, handle: &Handle, key: &Key) -> Option<Type> {
-        self.get_type_for_surface(handle, key, true)
-    }
-
-    fn get_type_trace_for_surface(
-        &self,
-        handle: &Handle,
-        range: TextRange,
-        for_display: bool,
-    ) -> Option<Type> {
-        let ans = self.get_answers(handle)?;
-        if for_display {
-            ans.get_type_trace_for_display(range)
-        } else {
-            ans.get_type_trace(range)
-        }
+    fn get_type_trace_for_surface(&self, handle: &Handle, range: TextRange) -> Option<Type> {
+        self.get_answers(handle)?.get_type_trace(range)
     }
 
     pub fn get_type_trace(&self, handle: &Handle, range: TextRange) -> Option<Type> {
-        self.get_type_trace_for_surface(handle, range, false)
-    }
-
-    pub fn get_type_trace_for_display(&self, handle: &Handle, range: TextRange) -> Option<Type> {
-        self.get_type_trace_for_surface(handle, range, true)
+        self.get_type_trace_for_surface(handle, range)
     }
 
     fn get_chosen_overload_trace_for_surface(
         &self,
         handle: &Handle,
         range: TextRange,
-        for_display: bool,
     ) -> Option<Type> {
-        let ans = self.get_answers(handle)?;
-        if for_display {
-            ans.get_chosen_overload_trace_for_display(range)
-        } else {
-            ans.get_chosen_overload_trace(range)
-        }
+        self.get_answers(handle)?.get_chosen_overload_trace(range)
     }
 
     fn get_active_call_argument_type_for_surface(
         &self,
         handle: &Handle,
         position: TextSize,
-        for_display: bool,
     ) -> Option<Type> {
         let CallInfo {
             callables,
@@ -901,11 +877,7 @@ impl<'a> Transaction<'a> {
         let params = Self::normalize_singleton_function_type_into_params(callable)?;
         let arg_index = Self::active_parameter_index(&params, &active_argument)?;
         let ty = params.get(arg_index)?.as_type().clone();
-        if for_display {
-            Some(self.get_answers(handle)?.solver().for_display(ty))
-        } else {
-            Some(ty)
-        }
+        Some(ty)
     }
 
     fn import_handle_with_preference(
@@ -914,9 +886,27 @@ impl<'a> Transaction<'a> {
         module: ModuleName,
         preference: FindPreference,
     ) -> Option<Handle> {
-        match preference.prefer_pyi {
-            true => self.import_handle(handle, module, None).finding(),
-            false => self
+        match (preference.replacement_policy, preference.prefer_pyi) {
+            (ImportReplacementPolicy::Bypass, true) => self
+                .import_handle_including_replaced(
+                    handle,
+                    module,
+                    ModuleStyle::Interface,
+                    (!preference.disable_style_fallback).then_some(ModuleStyle::Executable),
+                )
+                .finding(),
+            (ImportReplacementPolicy::Bypass, false) => self
+                .import_handle_including_replaced(
+                    handle,
+                    module,
+                    ModuleStyle::Executable,
+                    (!preference.disable_style_fallback).then_some(ModuleStyle::Interface),
+                )
+                .finding(),
+            (ImportReplacementPolicy::Respect, true) => {
+                self.import_handle(handle, module, None).finding()
+            }
+            (ImportReplacementPolicy::Respect, false) => self
                 .import_handle_prefer_executable(handle, module, None)
                 .finding(),
         }
@@ -952,7 +942,6 @@ impl<'a> Transaction<'a> {
         handle: &Handle,
         position: TextSize,
         prefer_result_type: bool,
-        for_display: bool,
     ) -> Option<Type> {
         let module = self.get_ast(handle)?;
         let covering_nodes = Ast::locate_node(&module, position);
@@ -962,21 +951,17 @@ impl<'a> Transaction<'a> {
             }
             let range = node.range();
             if prefer_result_type {
-                if let Some(ty) = self.get_type_trace_for_surface(handle, range, for_display) {
+                if let Some(ty) = self.get_type_trace_for_surface(handle, range) {
                     return Some(ty);
                 }
-                if let Some(callable) =
-                    self.get_chosen_overload_trace_for_surface(handle, range, for_display)
-                {
+                if let Some(callable) = self.get_chosen_overload_trace_for_surface(handle, range) {
                     return Some(callable);
                 }
             } else {
-                if let Some(callable) =
-                    self.get_chosen_overload_trace_for_surface(handle, range, for_display)
-                {
+                if let Some(callable) = self.get_chosen_overload_trace_for_surface(handle, range) {
                     return Some(callable);
                 }
-                if let Some(ty) = self.get_type_trace_for_surface(handle, range, for_display) {
+                if let Some(ty) = self.get_type_trace_for_surface(handle, range) {
                     return Some(ty);
                 }
             }
@@ -988,7 +973,6 @@ impl<'a> Transaction<'a> {
         &self,
         handle: &Handle,
         position: TextSize,
-        for_display: bool,
     ) -> Option<Type> {
         let module = self.get_ast(handle)?;
         let covering_nodes = Ast::locate_node(&module, position);
@@ -1007,16 +991,15 @@ impl<'a> Transaction<'a> {
             _ => None,
         })?;
         let key = Key::PatternNarrow(case_range);
-        if self
-            .get_bindings(handle)
-            .is_some_and(|bindings| bindings.is_valid_key(&key))
+        if let Some(answers) = self.get_answers(handle)
+            && answers.bindings().is_valid_key(&key)
         {
-            self.get_type_for_surface(handle, &key, for_display)
+            answers.get_type_at(answers.bindings().key_to_idx(&key))
         } else {
             // The subject must be looked up by its whole range: a position inside it
             // resolves the leading token, which is the base (`obj` in `match obj.attr:`)
             // rather than the subject expression.
-            self.get_type_trace_for_surface(handle, subject_range, for_display)
+            self.get_type_trace_for_surface(handle, subject_range)
         }
     }
 
@@ -1314,13 +1297,8 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    fn get_type_at_impl(
-        &self,
-        handle: &Handle,
-        position: TextSize,
-        for_display: bool,
-    ) -> Option<Type> {
-        self.get_type_at_impl_with_options(handle, position, for_display, true)
+    fn get_type_at_impl(&self, handle: &Handle, position: TextSize) -> Option<Type> {
+        self.get_type_at_impl_with_options(handle, position, true)
     }
 
     /// Classify how the identifier `identifier` in `context` resolves to a type.
@@ -1408,7 +1386,6 @@ impl<'a> Transaction<'a> {
         &self,
         handle: &Handle,
         position: TextSize,
-        for_display: bool,
         coerce_callees: bool,
     ) -> Option<Type> {
         let Some(IdentifierWithContext {
@@ -1417,10 +1394,8 @@ impl<'a> Transaction<'a> {
         }) = self.identifier_at(handle, position)
         else {
             return self
-                .type_from_match_wildcard_at_impl(handle, position, for_display)
-                .or_else(|| {
-                    self.type_from_expression_at_impl(handle, position, false, for_display)
-                });
+                .type_from_match_wildcard_at_impl(handle, position)
+                .or_else(|| self.type_from_expression_at_impl(handle, position, false));
         };
         let kind = self.classify_surface(handle, &identifier, &context);
         self.type_from_resolution(
@@ -1429,7 +1404,6 @@ impl<'a> Transaction<'a> {
             &identifier,
             &context,
             kind,
-            for_display,
             coerce_callees,
         )
     }
@@ -1445,27 +1419,28 @@ impl<'a> Transaction<'a> {
         identifier: &Identifier,
         context: &IdentifierContext,
         kind: ResolutionKind,
-        for_display: bool,
         coerce_callees: bool,
     ) -> Option<Type> {
         match kind {
             ResolutionKind::Type(ty) => Some(ty),
             ResolutionKind::ActiveCallArgument(position) => {
-                self.get_active_call_argument_type_for_surface(handle, position, for_display)
+                self.get_active_call_argument_type_for_surface(handle, position)
             }
             ResolutionKind::KeyInModule(handle, key) => {
-                let bindings = self.get_bindings(&handle)?;
+                let answers = self.get_answers(&handle)?;
+                let bindings = answers.bindings();
                 if !bindings.is_valid_key(&key) {
                     return None;
                 }
-                self.get_type_for_surface(&handle, &key, for_display)
+                answers.get_type_at(bindings.key_to_idx(&key))
             }
             ResolutionKind::Key(key) => {
-                let bindings = self.get_bindings(handle)?;
+                let answers = self.get_answers(handle)?;
+                let bindings = answers.bindings();
                 if !bindings.is_valid_key(&key) {
                     return None;
                 }
-                let mut ty = self.get_type_for_surface(handle, &key, for_display)?;
+                let mut ty = answers.get_type_at(bindings.key_to_idx(&key))?;
                 // Only a plain expression reference coerces to its callee signature.
                 if coerce_callees && let IdentifierContext::Expr(_) = context {
                     let call_args_range = self.callee_at(handle, position).and_then(
@@ -1476,11 +1451,7 @@ impl<'a> Transaction<'a> {
                         },
                     );
                     if let Some(arguments_range) = call_args_range {
-                        if let Some(ret) = self.get_chosen_overload_trace_for_surface(
-                            handle,
-                            arguments_range,
-                            for_display,
-                        ) {
+                        if let Some(ret) = answers.get_chosen_overload_trace(arguments_range) {
                             return Some(ret);
                         }
                         ty = self.coerce_type_to_callable(handle, ty);
@@ -1494,26 +1465,19 @@ impl<'a> Transaction<'a> {
                     func, arguments, ..
                 }) = &self.callee_at(handle, position)
                     && func.range() == range
-                    && let Some(ret) = self.get_chosen_overload_trace_for_surface(
-                        handle,
-                        arguments.range,
-                        for_display,
-                    )
+                    && let Some(ret) =
+                        self.get_chosen_overload_trace_for_surface(handle, arguments.range)
                 {
                     Some(ret)
                 } else {
-                    self.get_type_trace_for_surface(handle, range, for_display)
+                    self.get_type_trace_for_surface(handle, range)
                 }
             }
         }
     }
 
     pub fn get_type_at(&self, handle: &Handle, position: TextSize) -> Option<Type> {
-        self.get_type_at_impl(handle, position, false)
-    }
-
-    pub fn get_type_at_for_display(&self, handle: &Handle, position: TextSize) -> Option<Type> {
-        self.get_type_at_impl(handle, position, true)
+        self.get_type_at_impl(handle, position)
     }
 
     /// Like `get_type_at`, but returns the raw bound type of an identifier
@@ -1531,7 +1495,7 @@ impl<'a> Transaction<'a> {
         handle: &Handle,
         position: TextSize,
     ) -> Option<Type> {
-        self.get_type_at_impl_with_options(handle, position, false, false)
+        self.get_type_at_impl_with_options(handle, position, false)
     }
 
     /// Computed type for the TSP `getComputedType` endpoint.
@@ -1563,29 +1527,16 @@ impl<'a> Transaction<'a> {
                     | ResolutionKind::ActiveCallArgument(_)
             )
         {
-            self.type_from_resolution(
-                handle,
-                range.start(),
-                &identifier,
-                &context,
-                kind,
-                false,
-                false,
-            )
+            self.type_from_resolution(handle, range.start(), &identifier, &context, kind, false)
         } else {
             self.get_type_trace(handle, range)
         }
     }
 
-    fn get_result_type_at_impl(
-        &self,
-        handle: &Handle,
-        position: TextSize,
-        for_display: bool,
-    ) -> Option<Type> {
+    fn get_result_type_at_impl(&self, handle: &Handle, position: TextSize) -> Option<Type> {
         match self.identifier_at(handle, position) {
-            None => self.type_from_expression_at_impl(handle, position, true, for_display),
-            _ => self.get_type_at_impl(handle, position, for_display),
+            None => self.type_from_expression_at_impl(handle, position, true),
+            _ => self.get_type_at_impl(handle, position),
         }
     }
 
@@ -1594,15 +1545,7 @@ impl<'a> Transaction<'a> {
     /// provide-type endpoint where `+pos` should return `Literal[False]` rather
     /// than the `__pos__` method signature.
     pub fn get_result_type_at(&self, handle: &Handle, position: TextSize) -> Option<Type> {
-        self.get_result_type_at_impl(handle, position, false)
-    }
-
-    pub fn get_result_type_at_for_display(
-        &self,
-        handle: &Handle,
-        position: TextSize,
-    ) -> Option<Type> {
-        self.get_result_type_at_impl(handle, position, true)
+        self.get_result_type_at_impl(handle, position)
     }
 
     /// The type that the context at `position` expects a value to have.
@@ -1622,7 +1565,7 @@ impl<'a> Transaction<'a> {
     pub fn get_expected_type_at(&self, handle: &Handle, position: TextSize) -> Option<Type> {
         // Call-argument position: predict the active parameter's type from the
         // call signature. Works for not-yet-typed arguments and selects an overload.
-        if let Some(ty) = self.get_active_call_argument_type_for_surface(handle, position, false) {
+        if let Some(ty) = self.get_active_call_argument_type_for_surface(handle, position) {
             return Some(ty);
         }
 
@@ -1682,8 +1625,8 @@ impl<'a> Transaction<'a> {
             Type::Quantified(quantified) => match quantified.restriction {
                 Restriction::Bound(bound) => Self::callable_from_type(solver, bound),
                 Restriction::Constraints(options) => Self::callable_from_types(solver, options),
-                Restriction::Flag(domain) => {
-                    Self::callable_from_types(solver, domain.types(solver.stdlib))
+                Restriction::ShapeExtension(extension) => {
+                    Self::callable_from_types(solver, extension.upper_bound_members(solver.stdlib))
                 }
                 Restriction::Unrestricted => None,
             },
@@ -1984,6 +1927,7 @@ impl<'a> Transaction<'a> {
                     def.docstring_range,
                 ))
             }
+            AttrDefinition::Synthetic => None,
         }
     }
 
@@ -2023,8 +1967,9 @@ impl<'a> Transaction<'a> {
         key: &Key,
         preference: FindPreference,
     ) -> Option<(Handle, Export)> {
-        let bindings = self.get_bindings(handle)?;
-        let intermediate_definition = key_to_intermediate_definition(&bindings, key)?;
+        let answers = self.get_answers(handle)?;
+        let bindings = answers.bindings();
+        let intermediate_definition = key_to_intermediate_definition(bindings, key)?;
         let (definition_handle, mut export) =
             self.resolve_intermediate_definition(handle, intermediate_definition, preference)?;
         if let Export {
@@ -2032,7 +1977,7 @@ impl<'a> Transaction<'a> {
             ..
         } = &export
             && *symbol_kind == SymbolKind::Variable
-            && let Some(type_) = self.get_type(handle, key)
+            && let Some(type_) = answers.get_type_at(bindings.key_to_idx(key))
         {
             let symbol_kind = match type_ {
                 Type::Callable(_) | Type::Function(_) => SymbolKind::Function,
@@ -2072,9 +2017,10 @@ impl<'a> Transaction<'a> {
         key: &Key,
         preference: FindPreference,
     ) -> Result<Option<(Handle, Export)>, EmptyResponseReason> {
-        let bindings = self
-            .get_bindings(handle)
-            .ok_or(EmptyResponseReason::BindingsNotFound)?;
+        let answers = self
+            .get_answers(handle)
+            .ok_or(EmptyResponseReason::AnswersNotFound)?;
+        let bindings = answers.bindings();
         if !bindings.is_valid_key(key) {
             return Ok(None);
         }
@@ -2193,10 +2139,6 @@ impl<'a> Transaction<'a> {
                     .unwrap_or_default(),
                 );
                 defs
-            }
-            // Workaround so functions decorated with `functools.lru_cache` go to definition on the source, not the decorator.
-            Type::ClassType(class) if class.has_qname("functools", "_lru_cache_wrapper") => {
-                vec![]
             }
             Type::ClassType(_) => self
                 .find_attribute_definition_for_base_type(handle, preference, ty, &dunder::CALL)
@@ -2320,8 +2262,8 @@ impl<'a> Transaction<'a> {
             .iter()
             .find_map(|node| match node {
                 AnyNodeRef::ExprCompare(compare) => {
-                    let mut left = compare.left.as_ref();
-                    for (op, right) in compare.ops.iter().zip(compare.comparators.iter()) {
+                    let mut left = compare.first_operand();
+                    for (op, right) in compare.ops.iter().zip(compare.comparators()) {
                         if !Self::position_is_between(
                             position,
                             left.range().end(),
@@ -2496,7 +2438,7 @@ impl<'a> Transaction<'a> {
         if position < subscript.value.range().end() {
             return None;
         }
-        self.get_chosen_overload_trace_for_surface(handle, subscript.range(), true)
+        self.get_chosen_overload_trace_for_surface(handle, subscript.range())
     }
 
     pub(crate) fn operator_type_at(&self, handle: &Handle, position: TextSize) -> Option<Type> {
@@ -2508,7 +2450,7 @@ impl<'a> Transaction<'a> {
         let dunder = self
             .find_operator_dunder(handle, position, &covering_nodes)
             .ok()??;
-        self.get_chosen_overload_trace_for_surface(handle, dunder.range, true)
+        self.get_chosen_overload_trace_for_surface(handle, dunder.range)
     }
 
     /// Try operator-based go-to-definition. Returns `Ok(None)` when there is
@@ -2811,16 +2753,28 @@ impl<'a> Transaction<'a> {
                         }
                     }
                     ExprContext::Load | ExprContext::Del | ExprContext::Invalid => {
+                        let definition = self.find_definition_for_name_use(handle, &id, preference);
+                        // A decorator may give a function a class instance type. Preserve the
+                        // function definition instead of navigating to the instance's `__call__`.
+                        let is_function_or_method = match &definition {
+                            Ok(Some(item)) => matches!(
+                                item.metadata.symbol_kind(),
+                                Some(SymbolKind::Function | SymbolKind::Method)
+                            ),
+                            Ok(None) | Err(_) => false,
+                        };
                         // If this name is the callee of a call expression, jump
                         // to constructor or __call__ definitions when applicable.
                         if preference.resolve_call_dunders
+                            && !is_function_or_method
                             && let Some(AnyNodeRef::ExprCall(call)) = covering_nodes.get(1)
                             && call.func.range() == id.range
-                            && let Some(bindings) = self.get_bindings(handle)
+                            && let Some(answers) = self.get_answers(handle)
                         {
+                            let bindings = answers.bindings();
                             let key = Key::BoundName(ShortIdentifier::new(&id));
                             if bindings.is_valid_key(&key)
-                                && let Some(ty) = self.get_type(handle, &key)
+                                && let Some(ty) = answers.get_type_at(bindings.key_to_idx(&key))
                             {
                                 let defs =
                                     self.find_call_target_definitions(handle, preference, ty);
@@ -2830,7 +2784,7 @@ impl<'a> Transaction<'a> {
                             }
                         }
                         // This is a usage of the variable
-                        match self.find_definition_for_name_use(handle, &id, preference)? {
+                        match definition? {
                             Some(item) => Ok(vec1![item]),
                             None => Err(EmptyResponseReason::DefinitionNotFound {
                                 name: id.id.to_string(),
@@ -3173,6 +3127,7 @@ impl<'a> Transaction<'a> {
             position,
             FindPreference {
                 prefer_pyi: false,
+                replacement_policy: ImportReplacementPolicy::Bypass,
                 ..Default::default()
             },
         );
@@ -3236,9 +3191,10 @@ impl<'a> Transaction<'a> {
             );
             // The binding table already holds the `def` name, so this stays a
             // read-only lookup with nothing to solve.
-            let Some(bindings) = self.get_bindings(&def_handle) else {
-                return Some(Err(EmptyResponseReason::BindingsNotFound));
+            let Some(answers) = self.get_answers(&def_handle) else {
+                return Some(Err(EmptyResponseReason::AnswersNotFound));
             };
+            let bindings = answers.bindings();
             return Some(
                 bindings
                     .function_def_range(func_id.def_index)
@@ -3392,7 +3348,8 @@ impl<'a> Transaction<'a> {
         // user the same quick fix twice. Keying on (title, edit range, edit text)
         // treats two actions as equal when they would make the same visible edit.
         let mut other_action_keys: HashSet<(String, TextRange, String)> = HashSet::new();
-        if let Some(bindings) = self.get_bindings(handle) {
+        if let Some(answers) = self.get_answers(handle) {
+            let bindings = answers.bindings();
             for unused in bindings.unused_imports() {
                 if (unused.range.contains_range(range) || range.contains_range(unused.range))
                     && let Some(action) =
@@ -4266,7 +4223,8 @@ impl<'a> Transaction<'a> {
         ) {
             references.extend(pytest_references);
         }
-        if let Some(bindings) = self.get_bindings(handle) {
+        if let Some(answers) = self.get_answers(handle) {
+            let bindings = answers.bindings();
             let key = Key::Definition(ShortIdentifier::from_text_range(definition_range));
             if bindings.is_valid_key(&key) {
                 let binding = bindings.get(bindings.key_to_idx(&key));
@@ -4656,11 +4614,13 @@ impl<'a> Transaction<'a> {
         F: FnMut(&CompletionItem) -> Option<usize>,
     {
         // Check if position is in a disabled range (comments)
-        if let Some(module) = self.get_module_info(handle) {
-            let disabled_ranges = Self::comment_ranges_for_module(&module);
-            if disabled_ranges.iter().any(|range| range.contains(position)) {
-                return (Vec::new(), false);
-            }
+        if let Some(module) = self.get_module_info(handle)
+            && module
+                .ignore()
+                .comment_ranges()
+                .any(|range| range.contains(position))
+        {
+            return (Vec::new(), false);
         }
 
         let (mut results, is_incomplete) = self.completion_sorted_opt_with_incomplete(
@@ -4680,30 +4640,6 @@ impl<'a> Transaction<'a> {
         });
         results.dedup_by(|item1, item2| item1.label == item2.label && item1.detail == item2.detail);
         (results, is_incomplete)
-    }
-
-    fn comment_ranges_for_module(module: &ModuleInfo) -> Vec<TextRange> {
-        let mut ranges = Vec::new();
-        let source = module.lined_buffer().contents();
-        let mut offset = TextSize::from(0);
-
-        for line_with_ending in source.split_inclusive('\n') {
-            let line_without_lf = line_with_ending
-                .strip_suffix('\n')
-                .unwrap_or(line_with_ending);
-            let line = line_without_lf
-                .strip_suffix('\r')
-                .unwrap_or(line_without_lf);
-            if let Some(comment_pos) = pyrefly_python::ignore::find_comment_start_in_line(line) {
-                let comment_start = offset + TextSize::from(comment_pos as u32);
-                let comment_end = offset + TextSize::from(line.len() as u32);
-                ranges.push(TextRange::new(comment_start, comment_end));
-            }
-            offset += TextSize::try_from(line_with_ending.len())
-                .expect("source line length must fit in TextSize");
-        }
-
-        ranges
     }
 
     fn export_from_location(
@@ -4824,6 +4760,57 @@ impl<'a> Transaction<'a> {
         )
     }
 
+    /// Fuzzy-match `pattern` against one module's export table, resolving re-exports.
+    fn fuzzy_match_exports(
+        &self,
+        handle: &Handle,
+        exports_data: &Exports,
+        exports: &SmallMap<Name, ExportLocation>,
+        matcher: &SkimMatcherV2,
+        pattern: &str,
+    ) -> Vec<ExportMatch> {
+        let mut results = Vec::new();
+        for (name, location) in exports.iter() {
+            if let Some(score) = matcher.fuzzy_match(name.as_str(), pattern)
+                && let Some((canonical_handle, canonical_name, export)) =
+                    self.export_from_location(handle, name, location)
+            {
+                let import_from = if canonical_name == *name {
+                    canonical_handle.dupe()
+                } else {
+                    handle.dupe()
+                };
+                results.push(ExportMatch {
+                    score,
+                    definition: canonical_handle.dupe(),
+                    import_from: import_from.dupe(),
+                    name: name.clone(),
+                    export: export.clone(),
+                });
+                if import_from != *handle
+                    && (Self::should_include_reexport(handle, &canonical_handle, name)
+                        || (exports_data.is_explicit_reexport(name)
+                            && Self::allows_explicit_reexport(handle)))
+                {
+                    // Use handle (re-exporting module) so completions
+                    // generate the re-export import path, but zero out the
+                    // location because export.location is a byte range in
+                    // the canonical module's file, not this module's file.
+                    let mut reexport = export;
+                    reexport.location = TextRange::default();
+                    results.push(ExportMatch {
+                        score,
+                        definition: handle.dupe(),
+                        import_from: handle.dupe(),
+                        name: name.clone(),
+                        export: reexport,
+                    });
+                }
+            }
+        }
+        results
+    }
+
     pub fn search_exports_fuzzy(
         &self,
         pattern: &str,
@@ -4832,54 +4819,172 @@ impl<'a> Transaction<'a> {
         let mut res = self.search_exports(
             |handle, exports_data, exports| {
                 let matcher = SkimMatcherV2::default().smart_case();
-                let mut results = Vec::new();
-                for (name, location) in exports.iter() {
-                    if let Some(score) = matcher.fuzzy_match(name.as_str(), pattern)
-                        && let Some((canonical_handle, canonical_name, export)) =
-                            self.export_from_location(handle, name, location)
-                    {
-                        let import_from = if canonical_name == *name {
-                            canonical_handle.dupe()
-                        } else {
-                            handle.dupe()
-                        };
-                        results.push((
-                            score,
-                            canonical_handle.dupe(),
-                            import_from.dupe(),
-                            name.clone(),
-                            export.clone(),
-                        ));
-                        if import_from != *handle
-                            && (Self::should_include_reexport(handle, &canonical_handle, name)
-                                || (exports_data.is_explicit_reexport(name)
-                                    && Self::allows_explicit_reexport(handle)))
-                        {
-                            // Use handle (re-exporting module) so completions
-                            // generate the re-export import path, but zero out the
-                            // location because export.location is a byte range in
-                            // the canonical module's file, not this module's file.
-                            let mut reexport = export;
-                            reexport.location = TextRange::default();
-                            results.push((
-                                score,
-                                handle.dupe(),
-                                handle.dupe(),
-                                name.clone(),
-                                reexport,
-                            ));
-                        }
-                    }
-                }
-                results
+                self.fuzzy_match_exports(handle, exports_data, exports, &matcher, pattern)
             },
             custom_thread_pool,
         )?;
-        res.sort_by_key(|(score, _, _, _, _)| Reverse(*score));
-        Ok(res.into_map(|(_, definition, import_from, name, export)| {
-            (definition, import_from, name, export)
+        res.sort_by_key(|result| Reverse(result.score));
+        Ok(res.into_map(|result| {
+            (
+                result.definition,
+                result.import_from,
+                result.name,
+                result.export,
+            )
         }))
     }
+
+    /// Fuzzy-search module exports and cached nested symbols for names that match `pattern`.
+    pub fn search_workspace_symbols_fuzzy(
+        &self,
+        pattern: &str,
+        custom_thread_pool: Option<&ThreadPool>,
+    ) -> Result<Vec<SymbolMatch>, Cancelled> {
+        let module_results = self.search_exports(
+            |handle, exports_data, exports| {
+                let matcher = SkimMatcherV2::default().smart_case();
+                let mut results = self
+                    .fuzzy_match_exports(handle, exports_data, exports, &matcher, pattern)
+                    .into_iter()
+                    .map(|result| {
+                        let source_kind = (!result.export.location.is_empty())
+                            .then(|| {
+                                self.get_exports_data(&result.definition)
+                                    .symbols()
+                                    .and_then(|symbols| symbols.root_kind(result.export.location))
+                            })
+                            .flatten();
+                        SymbolMatch {
+                            score: result.score,
+                            handle: result.definition,
+                            name: result.name,
+                            kind: source_kind.or(result.export.symbol_kind),
+                            range: result.export.location,
+                            immediate_parent: None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                // A `FlatSymbol` stores only the range of its name, so the text
+                // is read back from the module that owns it.
+                if let Some(symbols) = exports_data.symbols()
+                    && let Some(module) = self.get_module_info(handle)
+                {
+                    // Only nested definitions. A name at module level is either
+                    // an export, and so already matched above with its re-exports
+                    // resolved, or is guarded by `if __name__ == "__main__"`,
+                    // which `workspace/symbol` does not surface from either source.
+                    results.extend(symbols.iter().filter_map(|(sym, parent)| {
+                        let parent = parent?;
+                        let name = module.code_at(sym.name.range());
+                        let score = matcher.fuzzy_match(name, pattern)?;
+                        Some(SymbolMatch {
+                            score,
+                            handle: handle.dupe(),
+                            name: Name::new(name),
+                            kind: Some(sym.kind),
+                            range: sym.name.range(),
+                            immediate_parent: Some(ImmediateParent {
+                                name: Name::new(module.code_at(parent.name.range())),
+                                range: parent.name.range(),
+                            }),
+                        })
+                    }));
+                }
+                vec![(handle.path().dupe(), results)]
+            },
+            custom_thread_pool,
+        )?;
+        let memory_paths = module_results
+            .iter()
+            .filter(|(path, _)| path.is_memory())
+            .map(|(path, _)| path.to_key_eq())
+            .collect::<HashSet<_>>();
+        let mut results = module_results
+            .into_iter()
+            .flat_map(|(_, results)| results)
+            .collect();
+        reduce_symbol_matches(&mut results, &memory_paths);
+        Ok(results)
+    }
+}
+
+struct ExportMatch {
+    score: i64,
+    definition: Handle,
+    import_from: Handle,
+    name: Name,
+    export: Export,
+}
+
+/// The immediate parent of a nested workspace symbol.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct ImmediateParent {
+    pub name: Name,
+    pub range: TextRange,
+}
+
+/// One fuzzy match for `workspace/symbol`. Export and nested matches share one ranking.
+#[derive(Clone)]
+pub struct SymbolMatch {
+    pub score: i64,
+    /// The module that the name resolves to, where `range` points.
+    pub handle: Handle,
+    pub name: Name,
+    pub kind: Option<SymbolKind>,
+    /// The range of the name, used as the navigation target.
+    pub range: TextRange,
+    pub immediate_parent: Option<ImmediateParent>,
+}
+
+fn compare_symbol_matches(left: &SymbolMatch, right: &SymbolMatch) -> Ordering {
+    Reverse(left.score)
+        .cmp(&Reverse(right.score))
+        .then_with(|| {
+            left.handle
+                .path()
+                .is_init()
+                .cmp(&right.handle.path().is_init())
+        })
+        .then_with(|| {
+            left.handle
+                .path()
+                .as_path()
+                .cmp(right.handle.path().as_path())
+        })
+        .then_with(|| left.range.start().cmp(&right.range.start()))
+        .then_with(|| left.range.end().cmp(&right.range.end()))
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.kind.cmp(&right.kind))
+        .then_with(|| {
+            left.immediate_parent
+                .as_ref()
+                .map(|parent| (&parent.name, parent.range.start(), parent.range.end()))
+                .cmp(
+                    &right
+                        .immediate_parent
+                        .as_ref()
+                        .map(|parent| (&parent.name, parent.range.start(), parent.range.end())),
+                )
+        })
+        .then_with(|| left.handle.cmp(&right.handle))
+}
+
+fn reduce_symbol_matches(results: &mut Vec<SymbolMatch>, memory_paths: &HashSet<ModulePath>) {
+    results.retain(|result| {
+        result.handle.path().is_memory()
+            || !memory_paths.contains(&result.handle.path().to_key_eq())
+    });
+
+    results.sort_by(compare_symbol_matches);
+    let mut seen = HashSet::new();
+    results.retain(|result| {
+        seen.insert((
+            result.handle.path().to_key_eq(),
+            result.name.clone(),
+            result.kind,
+            result.immediate_parent.clone(),
+        ))
+    });
 }
 
 trait RdepTransaction {
@@ -5015,7 +5120,7 @@ fn compute_transitive_rdeps_for_definition_impl<T: RdepTransaction>(
                 sys_info,
             );
             let rdeps = transaction.transitive_rdeps(definition_handle.dupe());
-            // Same-module reference discovery reads the definition's AST, bindings, and answers,
+            // Same-module reference discovery reads the definition's AST and answers,
             // even though most reverse dependencies can be answered from their retained indexes.
             transaction.run_for_handles(&[definition_handle], Require::Everything)?;
             rdeps
@@ -5286,25 +5391,200 @@ impl<'a> CancellableTransaction<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use pyrefly_build::handle::Handle;
     use pyrefly_python::module::Module;
     use pyrefly_python::module_name::ModuleName;
     use pyrefly_python::module_path::ModulePath;
     use pyrefly_python::symbol_kind::SymbolKind;
+    use pyrefly_python::sys_info::SysInfo;
     use pyrefly_types::callable::Callable;
     use pyrefly_types::function::FuncMetadata;
     use pyrefly_types::function::Function;
     use pyrefly_types::heap::TypeHeap;
     use ruff_python_ast::name::Name;
+    use ruff_text_size::TextRange;
+    use ruff_text_size::TextSize;
 
+    use super::ImmediateParent;
+    use super::SymbolMatch;
     use super::Transaction;
     use super::attribute_symbol_kind_from_type;
+    use super::reduce_symbol_matches;
     use crate::types::callable::Param;
     use crate::types::callable::Required;
     use crate::types::types::Type;
+
+    fn symbol_match_with_path(
+        score: i64,
+        module: &str,
+        path: ModulePath,
+        start: u32,
+    ) -> SymbolMatch {
+        SymbolMatch {
+            score,
+            handle: Handle::new(ModuleName::from_str(module), path, SysInfo::default()),
+            name: Name::new(module),
+            kind: Some(SymbolKind::Function),
+            range: TextRange::new(TextSize::new(start), TextSize::new(start + 1)),
+            immediate_parent: None,
+        }
+    }
+
+    fn symbol_match(score: i64, module: &str, path: &str, start: u32) -> SymbolMatch {
+        symbol_match_with_path(
+            score,
+            module,
+            ModulePath::memory(PathBuf::from(path)),
+            start,
+        )
+    }
+
+    #[test]
+    fn workspace_symbol_reduction_prioritizes_score_over_init_path() {
+        let mut matches = vec![
+            symbol_match(1, "weak", "weak.py", 0),
+            symbol_match(100, "exact", "pkg/__init__.py", 0),
+        ];
+
+        reduce_symbol_matches(&mut matches, &HashSet::new());
+
+        assert_eq!(matches[0].name.as_str(), "exact");
+    }
+
+    #[test]
+    fn workspace_symbol_reduction_orders_equal_scores_by_path() {
+        let mut forward = vec![
+            symbol_match(10, "b", "b.py", 0),
+            symbol_match(10, "a", "a.py", 0),
+        ];
+        let mut reverse = vec![
+            symbol_match(10, "a", "a.py", 0),
+            symbol_match(10, "b", "b.py", 0),
+        ];
+
+        reduce_symbol_matches(&mut forward, &HashSet::new());
+        reduce_symbol_matches(&mut reverse, &HashSet::new());
+
+        for matches in [forward, reverse] {
+            assert_eq!(
+                matches
+                    .iter()
+                    .map(|result| result.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["a", "b"]
+            );
+        }
+    }
+
+    fn nested_symbol_match(
+        start: u32,
+        immediate_parent: &str,
+        immediate_parent_start: u32,
+    ) -> SymbolMatch {
+        let mut result = symbol_match(10, "method", "symbols.py", start);
+        result.kind = Some(SymbolKind::Method);
+        result.immediate_parent = Some(ImmediateParent {
+            name: Name::new(immediate_parent),
+            range: TextRange::new(
+                TextSize::new(immediate_parent_start),
+                TextSize::new(immediate_parent_start + 1),
+            ),
+        });
+        result
+    }
+
+    #[test]
+    fn workspace_symbol_reduction_preserves_reexport_result() {
+        let mut matches = vec![
+            symbol_match(10, "target", "implementation.py", 4),
+            symbol_match(10, "target", "implementation.py", 4),
+            symbol_match(10, "target", "pkg/__init__.py", 0),
+        ];
+
+        reduce_symbol_matches(&mut matches, &HashSet::new());
+
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().any(|result| result.handle.path().is_init()));
+    }
+
+    #[test]
+    fn workspace_symbol_reduction_collapses_declarations_with_different_ranges() {
+        let mut matches = vec![
+            nested_symbol_match(4, "Host", 0),
+            nested_symbol_match(8, "Host", 0),
+            nested_symbol_match(12, "Host", 0),
+        ];
+
+        reduce_symbol_matches(&mut matches, &HashSet::new());
+
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn workspace_symbol_reduction_preserves_different_immediate_parents() {
+        let mut matches = vec![
+            nested_symbol_match(4, "Host", 0),
+            nested_symbol_match(8, "Host", 20),
+        ];
+
+        reduce_symbol_matches(&mut matches, &HashSet::new());
+
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn workspace_symbol_reduction_discards_saved_snapshot() {
+        let path = PathBuf::from("target.py");
+        let mut saved_method =
+            symbol_match_with_path(10, "target", ModulePath::filesystem(path.clone()), 4);
+        saved_method.name = Name::new("method");
+        saved_method.immediate_parent = Some(ImmediateParent {
+            name: Name::new("OldHost"),
+            range: TextRange::new(TextSize::new(0), TextSize::new(1)),
+        });
+        let mut unsaved_method =
+            symbol_match_with_path(10, "target", ModulePath::memory(path.clone()), 8);
+        unsaved_method.name = Name::new("method");
+        unsaved_method.immediate_parent = Some(ImmediateParent {
+            name: Name::new("NewHost"),
+            range: TextRange::new(TextSize::new(2), TextSize::new(3)),
+        });
+        let mut matches = vec![saved_method, unsaved_method];
+        let memory_paths = HashSet::from([ModulePath::memory(path).to_key_eq()]);
+
+        reduce_symbol_matches(&mut matches, &memory_paths);
+
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].handle.path().is_memory());
+        assert_eq!(
+            matches[0]
+                .immediate_parent
+                .as_ref()
+                .map(|parent| parent.name.as_str()),
+            Some("NewHost")
+        );
+    }
+
+    #[test]
+    fn workspace_symbol_reduction_discards_saved_snapshot_without_memory_match() {
+        let path = PathBuf::from("target.py");
+        let mut matches = vec![symbol_match_with_path(
+            10,
+            "deleted",
+            ModulePath::filesystem(path.clone()),
+            4,
+        )];
+        let memory_paths = HashSet::from([ModulePath::memory(path).to_key_eq()]);
+
+        reduce_symbol_matches(&mut matches, &memory_paths);
+
+        assert!(matches.is_empty());
+    }
 
     fn any_type() -> Type {
         TypeHeap::new().mk_any_explicit()

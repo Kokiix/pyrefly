@@ -68,6 +68,18 @@ pub(crate) fn has_int_tuple_bound(q: &Quantified) -> bool {
         && matches!(q.restriction(), Restriction::Bound(Type::IntTuple(_)))
 }
 
+/// Preserve the shape domain when an `IntTuple`-bounded variable has no precise solution.
+pub(crate) fn quantified_gradual_type(q: &Quantified) -> Type {
+    if q.default().is_none()
+        && q.kind() == QuantifiedKind::TypeVar
+        && let Restriction::Bound(bound @ Type::IntTuple(_)) = q.restriction()
+    {
+        bound.clone()
+    } else {
+        q.as_gradual_type()
+    }
+}
+
 fn int_tuples_member(ty: &Type) -> Option<Type> {
     IntTuple::from_shape_arg_type(ty)
         .or_else(|| tuple_carrier_to_shape(ty))
@@ -253,6 +265,7 @@ pub(crate) fn simplify_shape_type(ty: &mut Type) {
 
 #[cfg(test)]
 mod tests {
+    use pyrefly_types::identity::IdentityIgnored;
     use pyrefly_types::lit_int::LitInt;
     use pyrefly_types::shaped_array::IntTuple;
     use pyrefly_types::tuple::Tuple;
@@ -304,7 +317,7 @@ mod tests {
                 Type::Tuple(Tuple::Concrete(vec![raw_shape(2)])),
                 Type::Tuple(Tuple::Concrete(vec![raw_shape(3)])),
             ],
-            display_name: None,
+            display_name: IdentityIgnored(None),
         }));
         assert_eq!(
             canonicalize_int_tuples_sequence(&candidate, &TypeHeap::new()),
@@ -317,7 +330,7 @@ mod tests {
                         IntTuple::new(vec![Int::Literal(3)]).to_shape_arg_type(),
                     ])),
                 ],
-                display_name: None,
+                display_name: IdentityIgnored(None),
             }))
         );
     }

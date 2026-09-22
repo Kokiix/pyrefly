@@ -58,6 +58,22 @@ $ echo "x: str = 0" > $TMPDIR/oops.py && echo "errors = { bad-assignment = false
 [0]
 ```
 
+## Replaced imports resolve exported and missing names to Any
+
+`replace-imports-with-any` discards the module's type information even when its
+source exists. Both names the source exports and names it does not export are
+therefore `Any`.
+
+```scrut {output_stream: stderr}
+$ mkdir $TMPDIR/replace_with_any && \
+> printf 'replace-imports-with-any = ["module"]\n' > $TMPDIR/replace_with_any/pyrefly.toml && \
+> printf 'class Exported: ...\n' > $TMPDIR/replace_with_any/module.py && \
+> printf 'from typing import Any, assert_type\nfrom module import Exported, Missing\n\nassert_type(Exported, Any)\nassert_type(Missing, Any)\n' > $TMPDIR/replace_with_any/main.py && \
+> $PYREFLY check -c $TMPDIR/replace_with_any/pyrefly.toml --output-format=min-text $TMPDIR/replace_with_any/main.py
+ INFO 0 errors
+[0]
+```
+
 ## Replaced imports remain dynamic when used as TypeVar bounds
 
 ```scrut {output_stream: stderr}
@@ -66,6 +82,46 @@ $ mkdir $TMPDIR/replace_bound && \
 > printf 'class Foo: ...\n' > $TMPDIR/replace_bound/module.py && \
 > printf 'from typing import TypeVar\nfrom module import Foo\n\nT = TypeVar("T", bound=Foo)\n\ndef f(arg: T) -> T:\n    arg.method()\n    return arg\n' > $TMPDIR/replace_bound/main.py && \
 > $PYREFLY check -c $TMPDIR/replace_bound/pyrefly.toml --output-format=min-text $TMPDIR/replace_bound/main.py
+ INFO 0 errors
+[0]
+```
+
+## Untyped third-party imports are followed by default
+
+```scrut {output_stream: stderr}
+$ mkdir -p $TMPDIR/untyped_import/site_packages/untyped_package && \
+> printf '' > $TMPDIR/untyped_import/site_packages/untyped_package/__init__.py && \
+> printf 'from untyped_package import missing\nmissing()\n' > $TMPDIR/untyped_import/main.py && \
+> printf 'project-includes = ["main.py"]\nsite-package-path = ["site_packages"]\nskip-interpreter-query = true\n' > $TMPDIR/untyped_import/pyrefly.toml && \
+> $PYREFLY check -c $TMPDIR/untyped_import/pyrefly.toml --output-format=min-text
+ INFO Checking project configured at `*/pyrefly.toml` (glob)
+ INFO 1 error
+[1]
+```
+
+## Replace untyped third-party imports with Any
+
+Same project, with the option turned on: `untyped_package` becomes `typing.Any`,
+so importing a name it does not define is no longer an error.
+
+```scrut {output_stream: stderr}
+$ $PYREFLY check -c $TMPDIR/untyped_import/pyrefly.toml --replace-untyped-imports-with-any untyped_package --output-format=min-text
+ INFO Checking project configured at `*/pyrefly.toml` (glob)
+ INFO 0 errors
+[0]
+```
+
+## `--replace-untyped-imports-with-any` ignores bundled stubs
+
+Pyrefly's bundled `pandas` stubs should not prevent `pandas` from being detected as untyped.
+
+```scrut {output_stream: stderr}
+$ mkdir -p $TMPDIR/untyped_import/site_packages/pandas && \
+> printf '' > $TMPDIR/untyped_import/site_packages/pandas/__init__.py && \
+> printf 'from pandas import missing\nmissing()\n' > $TMPDIR/untyped_import/main.py && \
+> printf 'project-includes = ["main.py"]\nsite-package-path = ["site_packages"]\nskip-interpreter-query = true\n' > $TMPDIR/untyped_import/pyrefly.toml && \
+> $PYREFLY check -c $TMPDIR/untyped_import/pyrefly.toml --output-format=min-text --replace-untyped-imports-with-any pandas
+ INFO Checking project configured at `*/pyrefly.toml` (glob)
  INFO 0 errors
 [0]
 ```

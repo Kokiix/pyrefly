@@ -190,6 +190,65 @@ impl Incremental {
 }
 
 #[test]
+fn test_index_shape_argument_edit_invalidates_consumer() {
+    let mut i = Incremental::with_files(vec![
+        "main".to_owned(),
+        "consumer".to_owned(),
+        "shape_extensions".to_owned(),
+    ]);
+    i.set(
+        "shape_extensions",
+        r#"
+from typing import Any
+class IntTuple: pass
+class Index: pass
+def index_shape(shape: IntTuple, index: Any) -> IntTuple: ...
+"#,
+    );
+    i.set(
+        "main",
+        r#"
+from typing import Literal
+from shape_extensions import IntTuple, index_shape
+
+class Array[Shape: IntTuple]: ...
+def selected() -> Array[index_shape(IntTuple[10, 20], slice[Literal[1], Literal[5], None])]: ...
+"#,
+    );
+    i.set(
+        "consumer",
+        r#"
+from typing import assert_type
+from shape_extensions import IntTuple
+from main import Array, selected
+
+assert_type(selected(), Array[IntTuple[4, 20]])
+"#,
+    );
+    i.check(&["consumer"], &["consumer", "main", "shape_extensions"]);
+
+    i.set(
+        "main",
+        r#"
+from typing import Literal
+from shape_extensions import IntTuple, index_shape
+
+class Array[Shape: IntTuple]: ...
+def selected() -> Array[index_shape(IntTuple[10, 20], slice[Literal[1], Literal[7], None])]: ...
+"#,
+    );
+    let changed = i.unchecked(&["consumer"]);
+    changed.check_recompute(&["consumer", "main"]);
+    let errors = changed.errors.collect_display_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0]
+            .msg()
+            .contains("assert_type(Array[[6, 20]], Array[[4, 20]]) failed")
+    );
+}
+
+#[test]
 fn test_type_shape_dsl_body_edit_invalidates_importer() {
     let mut i = Incremental::with_files(vec![
         "foo".to_owned(),
@@ -448,6 +507,66 @@ def leaf(first: Int, second: Int) -> Int:
     );
     let changed = i.unchecked(&["consumer"]);
     changed.check_recompute(&["consumer", "helpers", "main"]);
+    let errors = changed.errors.collect_display_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].msg().contains("not assignable to `Tensor[[2]]`"));
+}
+
+#[test]
+fn test_type_shape_dsl_broadcast_edit_invalidates_importer() {
+    let mut i = Incremental::with_files(vec![
+        "main".to_owned(),
+        "consumer".to_owned(),
+        "shape_extensions".to_owned(),
+    ]);
+    i.set(
+        "shape_extensions",
+        r#"
+class IntTuple: pass
+def shaped_array[T](*, shape: str): ...
+def type_shape_dsl_function[F](fn: F) -> F: return fn
+
+@type_shape_dsl_function
+def broadcast(left: IntTuple, right: IntTuple) -> IntTuple:
+    return left
+"#,
+    );
+    i.set(
+        "main",
+        r#"
+from shape_extensions import IntTuple, broadcast, shaped_array
+
+@shaped_array(shape="Shape")
+class Tensor[Shape: IntTuple]: ...
+
+def chosen() -> Tensor[broadcast(IntTuple[2], IntTuple[3])]: ...
+"#,
+    );
+    i.set(
+        "consumer",
+        r#"
+from main import Tensor, chosen
+
+result: Tensor[[2]] = chosen()
+"#,
+    );
+    let initial = i.unchecked(&["consumer"]);
+    assert!(initial.errors.collect_display_errors().is_empty());
+
+    i.set(
+        "shape_extensions",
+        r#"
+class IntTuple: pass
+def shaped_array[T](*, shape: str): ...
+def type_shape_dsl_function[F](fn: F) -> F: return fn
+
+@type_shape_dsl_function
+def broadcast(left: IntTuple, right: IntTuple) -> IntTuple:
+    return right
+"#,
+    );
+    let changed = i.unchecked(&["consumer"]);
+    changed.check_recompute(&["consumer", "main", "shape_extensions"]);
     let errors = changed.errors.collect_display_errors();
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].msg().contains("not assignable to `Tensor[[2]]`"));
@@ -958,9 +1077,7 @@ def select(first: Int, second: Int) -> Int:
     );
     assert_eq!(errors[0].module().name(), ModuleName::from_str("consumer"),);
     assert!(
-        errors[0]
-            .msg()
-            .contains("not assignable to `Tensor[IntTuple[2]]`"),
+        errors[0].msg().contains("not assignable to `Tensor[[2]]`"),
         "expected a consumer assignment mismatch, got {errors:?}",
     );
 }

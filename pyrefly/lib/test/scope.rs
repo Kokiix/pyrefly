@@ -496,6 +496,79 @@ global a  # E: Could not find name `a`
 );
 
 testcase!(
+    test_global_assign_without_module_definition,
+    r#"
+def set_workload_id(value: str) -> None:
+    global workload_id
+    workload_id = value
+
+
+set_workload_id("test")
+assert globals()["workload_id"] == "test"
+"#,
+);
+
+testcase!(
+    test_global_read_without_definition_still_errors,
+    r#"
+def f() -> None:
+    global a  # E: Could not find name `a`
+    print(a)
+"#,
+);
+
+testcase!(
+    test_global_assign_nested_in_if,
+    r#"
+def f(cond: bool) -> None:
+    global a
+    if cond:
+        a = 1
+
+
+def g(cond: bool) -> None:
+    if cond:
+        global b
+        b = 2
+"#,
+);
+
+testcase!(
+    test_global_del_does_not_define,
+    r#"
+def f() -> None:
+    global z  # E: Could not find name `z`
+    del z
+"#,
+);
+
+testcase!(
+    test_global_assign_before_declaration_still_errors,
+    r#"
+def f() -> None:
+    x = 1
+    global x  # E: `x` was assigned in the current scope before the global declaration
+"#,
+);
+
+testcase!(
+    test_global_assign_at_module_top_level_still_errors,
+    r#"
+global a  # E: Could not find name `a`
+a = 1
+"#,
+);
+
+testcase!(
+    test_global_assign_in_class_body_still_errors,
+    r#"
+class C:
+    global cx  # E: Could not find name `cx`
+    cx = 1
+"#,
+);
+
+testcase!(
     test_nonlocal_not_found,
     r#"
 def f() -> None:
@@ -1559,7 +1632,7 @@ def f():
     # still marks x as local in f's scope.
     print(x)
     if False:
-        del x
+        del x  # E: This code is unreachable
 "#,
 );
 
@@ -1597,5 +1670,31 @@ class C:
     text: str = "hello"
     def method(self) -> None:
         result = [text := text.replace("a", "b") for _ in [1]]  # E: `text` is uninitialized
+"#,
+);
+
+// A `global`/`nonlocal` name assigned and then annotated in a class body leaves
+// a class field whose declaration lives in another scope, so it has no
+// annotation of its own to describe it with.
+testcase!(
+    test_annotated_global_in_class_body,
+    r#"
+x = 1
+class C:
+    global x
+    (x := 1)
+    x: int
+"#,
+);
+
+testcase!(
+    test_annotated_nonlocal_in_class_body,
+    r#"
+def f():
+    y = 1
+    class C:
+        nonlocal y
+        (y := 1)
+        y: int
 "#,
 );

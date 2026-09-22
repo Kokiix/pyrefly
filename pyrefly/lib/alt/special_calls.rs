@@ -13,6 +13,8 @@
 
 use pyrefly_python::dunder;
 use pyrefly_types::shaped_array::IntTuple;
+use pyrefly_types::shaped_array::IntTupleView;
+use pyrefly_types::shaped_array::is_tuple_carrier_shape_middle;
 use pyrefly_util::visit::Visit;
 use pyrefly_util::visit::VisitMut;
 use ruff_python_ast::Expr;
@@ -26,6 +28,7 @@ use crate::alt::answers_solver::AnswersSolver;
 use crate::alt::callable::CallArg;
 use crate::alt::callable::CallKeyword;
 use crate::alt::expr::ExprOptions;
+use crate::alt::shape_extension::is_int_tuple_bound;
 use crate::alt::solve::TypeFormContext;
 use crate::alt::types::decorated_function::Decorator;
 use crate::alt::unwrap::HintRef;
@@ -33,13 +36,34 @@ use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
 use crate::error::context::TypeCheckContext;
 use crate::error::context::TypeCheckKind;
+use crate::types::callable::Param;
+use crate::types::callable::Params;
 use crate::types::callable::unexpected_keyword;
 use crate::types::class::Class;
 use crate::types::function::FunctionKind;
 use crate::types::tuple::Tuple;
+use crate::types::types::Forallable;
 use crate::types::types::Type;
 
 impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
+    /// Interpret an arbitrary expression as a shape without trusting unvalidated type variables.
+    /// A valid type variable contributes the shape constraints from its normalized upper bound.
+    fn assert_shape_input_to_int_tuple(&self, ty: &Type) -> Option<IntTuple> {
+        let upper_bound = match ty {
+            Type::Quantified(q) if q.is_type_var() => Some(q.upper_bound(self.stdlib, self.heap)),
+            Type::TypeVar(tv) => Some(tv.upper_bound(self.stdlib, self.heap)),
+            _ => None,
+        };
+        if let Some(upper_bound) = upper_bound {
+            let int_type = self.stdlib.int().clone().to_type();
+            if !is_int_tuple_bound(&upper_bound, &int_type) {
+                return None;
+            }
+            return self.shape_arg_to_int_tuple(&upper_bound);
+        }
+        self.shape_arg_to_int_tuple(ty)
+    }
+
     pub fn call_assert_type(
         &self,
         args: &[Expr],
@@ -121,15 +145,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let arg_ty = arg.infer(self, errors);
         let args = [CallArg::ty(&arg_ty, arg.range())];
         // The ordinary call reports any argument/protocol errors and yields `int`.
-        let default = self.freeform_call_infer(
-            callee_ty,
-            &args,
-            keywords,
-            func_range,
-            arguments_range,
-            hint,
-            errors,
-        );
+        let default = self
+            .freeform_call_infer(
+                callee_ty,
+                &args,
+                keywords,
+                func_range,
+                arguments_range,
+                hint,
+                errors,
+            )
+            .ty;
         // Probe `__len__` silently, since `default` already emitted the real errors.
         let silent_errors = self.error_swallower();
         let int_ty = self.stdlib.int().clone().to_type();
@@ -199,33 +225,89 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     pub fn call_assert_shape(
         &self,
+        callee_ty: &Type,
         args: &[Expr],
         keywords: &[Keyword],
         range: TextRange,
         hint: Option<HintRef>,
         errors: &ErrorCollector,
     ) -> Type {
+        // `runtime=` overrides the shape the library is expected to produce, for the
+        // cases where it differs from the shape Pyrefly infers. Only the runtime
+        // helper reads it, while the positional argument is the static expectation
+        // whether or not it is present.
+        //
+        // A helper marked with `@defines_assert_shape` need not declare `runtime`,
+        // so an undeclared keyword falls through to the unexpected-keyword error,
+        // keeping Pyrefly's rules for the call in step with Python's.
+        let runtime_parameter = runtime_keyword_parameter(callee_ty);
+        let mut unexpected = Vec::new();
+        for keyword in keywords {
+            let is_runtime = keyword
+                .arg
+                .as_ref()
+                .is_some_and(|arg| arg.as_str() == "runtime");
+            if is_runtime && !matches!(runtime_parameter, RuntimeKeywordParameter::Missing) {
+                let ty = self.expr_infer(&keyword.value, errors);
+                if let RuntimeKeywordParameter::Typed(expected) = runtime_parameter
+                    && !expected.is_any()
+                {
+                    self.check_type(&ty, expected, keyword.value.range(), errors, &|| {
+                        TypeCheckContext::of_kind(TypeCheckKind::CallArgument(
+                            keyword.arg.as_ref().map(|arg| arg.id.clone()),
+                            None,
+                        ))
+                    });
+                }
+            } else {
+                self.expr_infer(&keyword.value, errors);
+                unexpected.push(keyword);
+            }
+        }
+
         let ret = if args.len() == 2 {
             let actual = self
                 .solver()
                 .force(self.expr_infer_with_hint(&args[0], hint, errors));
-            if let Type::ShapedArray(shaped_array) = &actual {
+            let (actual_shape, return_actual) = match &actual {
+                Type::ShapedArray(array) => (Some(array.shape()), true),
+                _ if actual.is_any() => (Some(IntTuple::shapeless()), false),
+                _ => (self.assert_shape_input_to_int_tuple(&actual), false),
+            };
+            if let Some(actual_shape) = actual_shape {
                 if let Some(shape) = self.parse_assert_shape_expr(&args[1], errors) {
-                    let expected = self
-                        .shaped_array_with_shape(shaped_array, shape.clone())
-                        .to_type();
-                    if !self.is_equivalent(&actual, &expected) {
+                    let expected = self.heap.mk_int_tuple(shape.clone());
+                    let constraint = match actual_shape.view() {
+                        IntTupleView::Unpacked {
+                            prefix,
+                            middle,
+                            suffix,
+                        } if is_tuple_carrier_shape_middle(middle) => IntTuple::unpacked(
+                            prefix.to_vec(),
+                            IntTuple::shapeless().to_shape_arg_type(),
+                            suffix.to_vec(),
+                        ),
+                        IntTupleView::Concrete(_)
+                        | IntTupleView::Gradual
+                        | IntTupleView::Unpacked { .. } => actual_shape.clone(),
+                    };
+                    let matches =
+                        self.is_equivalent(&expected, &self.heap.mk_int_tuple(constraint));
+                    if !matches {
                         self.error(
                             errors,
                             range,
                             ErrorKind::AssertType,
                             format!(
                                 "assert_shape({}, {}) failed",
-                                format_assert_shape_shape(&shaped_array.shape()),
+                                format_assert_shape_shape(&actual_shape),
                                 format_assert_shape_shape(&shape)
                             ),
                         );
                     }
+                    if return_actual { actual } else { expected }
+                } else {
+                    self.heap.mk_any_error()
                 }
             } else {
                 self.error(
@@ -233,12 +315,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     args[0].range(),
                     ErrorKind::BadArgumentType,
                     format!(
-                        "First argument to `assert_shape` must be a shaped array, got `{}`",
+                        "First argument to `assert_shape` must be an `IntTuple`, got `{}`",
                         self.for_display(actual.clone())
                     ),
                 );
+                self.heap.mk_any_error()
             }
-            actual
         } else {
             self.error(
                 errors,
@@ -251,7 +333,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             );
             self.heap.mk_any_error()
         };
-        for keyword in keywords {
+        for keyword in unexpected {
             unexpected_keyword(
                 &|msg| {
                     self.error(errors, range, ErrorKind::UnexpectedKeyword, msg);
@@ -786,6 +868,47 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             if applied { Some(arg_ty) } else { None }
         } else {
             None
+        }
+    }
+}
+
+enum RuntimeKeywordParameter<'a> {
+    Missing,
+    Untyped,
+    Typed(&'a Type),
+}
+
+/// The declared type of the `runtime` keyword that `assert_shape` accepts.
+///
+/// A signature Pyrefly cannot inspect as a plain parameter list is treated as
+/// accepting the keyword: an unknown signature is not evidence that the call is
+/// wrong, and the ordinary call machinery reports genuine mismatches.
+fn runtime_keyword_parameter(callee_ty: &Type) -> RuntimeKeywordParameter<'_> {
+    let signature = match callee_ty {
+        Type::Function(func) => &func.signature,
+        Type::Forall(forall) => match &forall.body {
+            Forallable::Function(func) => &func.signature,
+            _ => return RuntimeKeywordParameter::Untyped,
+        },
+        _ => return RuntimeKeywordParameter::Untyped,
+    };
+    match &signature.params {
+        Params::List(params) | Params::Partial(params) => {
+            for param in params.items() {
+                match param {
+                    Param::Pos(name, ty, ..) | Param::KwOnly(name, ty, ..)
+                        if name.as_str() == "runtime" =>
+                    {
+                        return RuntimeKeywordParameter::Typed(ty);
+                    }
+                    Param::Kwargs(_, ty) => return RuntimeKeywordParameter::Typed(ty),
+                    _ => {}
+                }
+            }
+            RuntimeKeywordParameter::Missing
+        }
+        Params::Ellipsis | Params::ParamSpec(..) | Params::Materialization => {
+            RuntimeKeywordParameter::Untyped
         }
     }
 }

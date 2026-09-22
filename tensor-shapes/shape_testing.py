@@ -58,6 +58,7 @@ class Suite:
     name: str
     patterns: tuple[str, ...]
     python_version: str = "3.13"
+    config: Path | None = None
     # Search paths beyond the stub tree and `shape_extensions`, for suites that
     # need extra fixtures on the path.
     extra_search_paths: tuple[Path, ...] = ()
@@ -68,6 +69,7 @@ class Suite:
     # are otherwise suppressed, which is why the torch corpus enables it only
     # for the dedicated negative-test directories.
     expectations: bool = False
+    strict_callable_subtyping: bool = False
 
     def files(self, package_root: Path) -> list[str]:
         paths = sorted(
@@ -80,16 +82,14 @@ class Suite:
         return [str(path.relative_to(package_root)) for path in paths]
 
 
-def venv_python(explicit: Path | None = None, *, extra_hint: str = "") -> Path:
+def venv_python(explicit: Path | None = None) -> Path:
     """Resolve the interpreter that has the shaped libraries installed.
 
     Order: an explicit `--python`, then $TENSOR_SHAPES_VENV, then the default
     virtualenv. This never creates anything -- see the module docstring.
 
-    Only the runtime tests need this. Type checking resolves the stubs through
-    `--search-path` and never imports the real library, so it runs with no
-    virtualenv at all; `extra_hint` is how a caller offering a static-only mode
-    advertises it here.
+    Runtime tests and partial stubs that re-export installed library definitions
+    need this.
     """
 
     # Made absolute throughout, because callers pass these on to child processes
@@ -115,10 +115,27 @@ def venv_python(explicit: Path | None = None, *, extra_hint: str = "") -> Path:
         hint = _BOOTSTRAP_HINT.format(
             bootstrap=(TENSOR_SHAPES_ROOT / "bootstrap_venv.py").relative_to(REPO_ROOT)
         )
-        raise SystemExit(
-            f"No tensor-shapes virtualenv at {venv} ({source}).\n\n{extra_hint}{hint}"
-        )
+        raise SystemExit(f"No tensor-shapes virtualenv at {venv} ({source}).\n\n{hint}")
     return python
+
+
+def venv_site_packages(python: Path) -> Path:
+    """Return the site-packages directory belonging to a virtualenv interpreter."""
+    venv = python.parent.parent
+    if os.name == "nt":
+        site_packages = venv / "Lib" / "site-packages"
+        if site_packages.is_dir():
+            return site_packages
+    else:
+        candidates = sorted((venv / "lib").glob("python*/site-packages"))
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            raise SystemExit(
+                f"Could not choose site-packages for {python}; found: "
+                + ", ".join(str(candidate) for candidate in candidates)
+            )
+    raise SystemExit(f"Could not locate site-packages for {python}")
 
 
 def pyrefly_command(
@@ -201,6 +218,8 @@ def check_suites(
     suites: list[Suite],
     nocapture: bool = False,
     check_stubs: bool = True,
+    stub_search_paths: tuple[Path, ...] = (),
+    site_package_paths: tuple[Path, ...] = (),
 ) -> int:
     """Type check the stubs and then every suite, returning the last nonzero exit code.
 
@@ -217,24 +236,33 @@ def check_suites(
         raise ValueError(f"no suites to check under {package_root}")
 
     failed = 0
-    for suite in [STUB_SUITE, *suites] if check_stubs else suites:
+    stub_suite = Suite(
+        name=STUB_SUITE.name,
+        patterns=STUB_SUITE.patterns,
+        extra_search_paths=stub_search_paths,
+    )
+    for suite in [stub_suite, *suites] if check_stubs else suites:
         files = suite.files(package_root)
         command = [
             *pyrefly,
             "check",
             "--config",
-            os.devnull,
+            str(suite.config or os.devnull),
             "--python-version",
             suite.python_version,
         ]
         if suite.expectations:
             command.append("--expectations")
+        if suite.strict_callable_subtyping:
+            command.append("--strict-callable-subtyping=true")
         for search_path in (
             *suite.extra_search_paths,
             package_root,
             SHAPE_EXTENSIONS_ROOT,
         ):
             command.extend(["--search-path", str(search_path)])
+        for site_package_path in site_package_paths:
+            command.extend(["--site-package-path", str(site_package_path)])
         command.extend(files)
 
         if nocapture:
@@ -291,7 +319,7 @@ def run_suites(
             "shape_extensions",
             SHAPE_EXTENSIONS_ROOT / "shape_extensions" / "__init__.py",
         )
-    import shape_extensions
+    import shape_extensions  # @manual=//pyrefly/tensor-shapes/pyrefly-shape-extensions:shape_extensions
 
     if not suites:
         raise ValueError(f"no suites to run under {package_root}")
@@ -310,17 +338,23 @@ def run_suites(
 
 def _run_test_file(*, library: str, path: Path, shape_extensions: Any) -> int:
     current_test: str | None = None
-    assert_shape_calls: dict[str, int] = {}
+    assertions: dict[str, int] = {}
     original_assert_shape: Callable[..., Any] = shape_extensions.assert_shape
+    original_assert_raises: Callable[..., Any] = shape_extensions.assert_raises
 
-    def counting_assert_shape(x: Any, shape: Any) -> Any:
+    def counting_assert_shape(x: Any, shape: Any, **kwargs: Any) -> Any:
         if current_test is not None:
-            assert_shape_calls[current_test] += 1
-        return original_assert_shape(x, shape)
+            assertions[current_test] += 1
+        return original_assert_shape(x, shape, **kwargs)
 
-    # Patch before importing so that a module-level
-    # `from shape_extensions import assert_shape` binds the counting wrapper.
+    def counting_assert_raises(*args: Any, **kwargs: Any) -> Any:
+        if current_test is not None:
+            assertions[current_test] += 1
+        return original_assert_raises(*args, **kwargs)
+
+    # Patch before importing so module-level imports bind the counting wrappers.
     shape_extensions.assert_shape = counting_assert_shape
+    shape_extensions.assert_raises = counting_assert_raises
     try:
         module = _load_module(f"_{library}_shape_test_{path.stem}", path)
         tests = [
@@ -330,28 +364,22 @@ def _run_test_file(*, library: str, path: Path, shape_extensions: Any) -> int:
         ]
         if not tests:
             raise AssertionError(f"{path} does not define any test functions")
-        # A module lists in GRADUAL_SHAPE_RUNTIME_TESTS the tests whose static
-        # shape is gradual. Those may fall back to plain runtime assertions,
-        # because assert_shape currently also demands an exact static shape.
-        # TODO(stroxler): Define how assert_shape should handle gradual static shapes.
-        gradual_shape_tests = set(getattr(module, "GRADUAL_SHAPE_RUNTIME_TESTS", ()))
-        unknown_markers = gradual_shape_tests - {name for name, _ in tests}
-        if unknown_markers:
-            raise AssertionError(
-                f"{path} marks unknown gradual-shape tests: {sorted(unknown_markers)}"
-            )
         for name, test in tests:
             current_test = name
-            assert_shape_calls[name] = 0
+            assertions[name] = 0
             test()
             current_test = None
-            # A test that asserts no shapes passes vacuously and would hide a
+            # A test with no runtime assertion passes vacuously and can hide a
             # regression, so treat it as a failure rather than a pass.
-            if assert_shape_calls[name] == 0 and name not in gradual_shape_tests:
-                raise AssertionError(f"{path}::{name} did not execute assert_shape")
+            if assertions[name] == 0:
+                raise AssertionError(
+                    f"{path}::{name} made no runtime assertions. Call "
+                    "`assert_shape` or `assert_raises`."
+                )
     finally:
         shape_extensions.assert_shape = original_assert_shape
+        shape_extensions.assert_raises = original_assert_raises
 
-    shapes = sum(assert_shape_calls.values())
+    shapes = sum(assertions.values())
     print(f"PASS {path.name} ({len(tests)} tests, {shapes} shapes)", flush=True)
     return len(tests)

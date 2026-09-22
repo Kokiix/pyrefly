@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from torch._shapes import (
         flatten_shape,
         glu_shape,
+        gru_output_shape,
+        gru_state_shape,
         interpolate_scalar_shape,
         lstm_cell_state_shape,
         pixel_shuffle_shape,
@@ -37,8 +39,111 @@ if TYPE_CHECKING:
         symmetric_pad2d_shape,
     )
 
-# Re-export submodules
-from . import functional as functional, init as init
+# Re-export the submodules `torch/nn/__init__.py` imports, so they resolve as attributes
+from . import (
+    attention as attention,
+    common_types as common_types,
+    functional as functional,
+    grad as grad,
+    init as init,
+    intrinsic as intrinsic,
+    modules as modules,
+    parallel as parallel,
+    parameter as parameter,
+    qat as qat,
+    quantizable as quantizable,
+    quantized as quantized,
+    utils as utils,
+)
+from .modules import (
+    AdaptiveLogSoftmaxWithLoss as AdaptiveLogSoftmaxWithLoss,
+    Bilinear as Bilinear,
+    ChannelShuffle as ChannelShuffle,
+    CircularPad1d as CircularPad1d,
+    CircularPad2d as CircularPad2d,
+    CircularPad3d as CircularPad3d,
+    ConstantPad1d as ConstantPad1d,
+    ConstantPad2d as ConstantPad2d,
+    ConstantPad3d as ConstantPad3d,
+    Container as Container,
+    CosineEmbeddingLoss as CosineEmbeddingLoss,
+    CosineSimilarity as CosineSimilarity,
+    CrossMapLRN2d as CrossMapLRN2d,
+    Fold as Fold,
+    FractionalMaxPool2d as FractionalMaxPool2d,
+    FractionalMaxPool3d as FractionalMaxPool3d,
+    GaussianNLLLoss as GaussianNLLLoss,
+    Hardshrink as Hardshrink,
+    Hardtanh as Hardtanh,
+    HingeEmbeddingLoss as HingeEmbeddingLoss,
+    LazyBatchNorm1d as LazyBatchNorm1d,
+    LazyBatchNorm2d as LazyBatchNorm2d,
+    LazyBatchNorm3d as LazyBatchNorm3d,
+    LazyConv1d as LazyConv1d,
+    LazyConv2d as LazyConv2d,
+    LazyConv3d as LazyConv3d,
+    LazyConvTranspose1d as LazyConvTranspose1d,
+    LazyConvTranspose2d as LazyConvTranspose2d,
+    LazyConvTranspose3d as LazyConvTranspose3d,
+    LazyInstanceNorm1d as LazyInstanceNorm1d,
+    LazyInstanceNorm2d as LazyInstanceNorm2d,
+    LazyInstanceNorm3d as LazyInstanceNorm3d,
+    LocalResponseNorm as LocalResponseNorm,
+    LogSigmoid as LogSigmoid,
+    LPPool1d as LPPool1d,
+    LPPool2d as LPPool2d,
+    LPPool3d as LPPool3d,
+    MarginRankingLoss as MarginRankingLoss,
+    MaxUnpool1d as MaxUnpool1d,
+    MaxUnpool2d as MaxUnpool2d,
+    MaxUnpool3d as MaxUnpool3d,
+    MultiheadAttention as MultiheadAttention,
+    MultiLabelMarginLoss as MultiLabelMarginLoss,
+    MultiLabelSoftMarginLoss as MultiLabelSoftMarginLoss,
+    MultiMarginLoss as MultiMarginLoss,
+    NLLLoss2d as NLLLoss2d,
+    PairwiseDistance as PairwiseDistance,
+    ParameterDict as ParameterDict,
+    PixelUnshuffle as PixelUnshuffle,
+    PoissonNLLLoss as PoissonNLLLoss,
+    ReflectionPad1d as ReflectionPad1d,
+    ReflectionPad3d as ReflectionPad3d,
+    ReplicationPad1d as ReplicationPad1d,
+    ReplicationPad3d as ReplicationPad3d,
+    RNN as RNN,
+    RNNBase as RNNBase,
+    RNNCell as RNNCell,
+    RNNCellBase as RNNCellBase,
+    RReLU as RReLU,
+    SoftMarginLoss as SoftMarginLoss,
+    Softmax2d as Softmax2d,
+    Softmin as Softmin,
+    Softshrink as Softshrink,
+    Softsign as Softsign,
+    SyncBatchNorm as SyncBatchNorm,
+    Tanhshrink as Tanhshrink,
+    Transformer as Transformer,
+    TransformerDecoder as TransformerDecoder,
+    TransformerDecoderLayer as TransformerDecoderLayer,
+    TransformerEncoder as TransformerEncoder,
+    TransformerEncoderLayer as TransformerEncoderLayer,
+    TripletMarginLoss as TripletMarginLoss,
+    TripletMarginWithDistanceLoss as TripletMarginWithDistanceLoss,
+    Unfold as Unfold,
+    UpsamplingBilinear2d as UpsamplingBilinear2d,
+    UpsamplingNearest2d as UpsamplingNearest2d,
+    ZeroPad1d as ZeroPad1d,
+    ZeroPad2d as ZeroPad2d,
+    ZeroPad3d as ZeroPad3d,
+)
+from .parallel import DataParallel as DataParallel
+from .parameter import (
+    UninitializedBuffer as UninitializedBuffer,
+    UninitializedParameter as UninitializedParameter,
+)
+
+# TODO: Add a precise signature for the remaining public API.
+factory_kwargs: Any
 
 # Base class for all neural network modules
 class Module:
@@ -52,8 +157,10 @@ class Module:
 
     def __init__(self) -> None: ...
     def __getattr__(self, name: str) -> Any: ...
+    def __setattr__(self, name: str, value: Any) -> None: ...
     __call__: ProxyMethod["forward"]
-    def forward(self, *args: Any, **kwargs: Any) -> Any: ...
+    forward: Callable[..., Any]
+    def extra_repr(self) -> str: ...
     def register_buffer(
         self, name: str, tensor: Tensor | None, persistent: bool = True
     ) -> None: ...
@@ -87,30 +194,19 @@ class Module:
         """Register a hook to be called before loading state_dict."""
         ...
 
-# Parameter wrapper
-# In PyTorch, nn.Parameter is a class, but for type checking we model it as a function
-# that returns Tensor (not Parameter) to match runtime behavior where operations on
-# Parameters return Tensors. This makes the type system simpler and more accurate.
-def Parameter[Shape: IntTuple](
-    data: Tensor[Shape], requires_grad: bool = True
-) -> Tensor[Shape]:
-    """
-    Wraps a tensor as a module parameter.
-    Returns the tensor (for type purposes) since operations on Parameters return Tensors.
-    """
-    ...
+class Parameter[Shape: IntTuple = IntTuple](Tensor[Shape]):
+    @overload
+    def __new__(
+        cls, data: Tensor[Shape], requires_grad: bool = True
+    ) -> Tensor[Shape]: ...
+    @overload
+    def __new__(cls, data: None = None, requires_grad: bool = True) -> Tensor: ...
 
-# Buffer wrapper
-# Similar to Parameter, Buffer wraps a tensor that is not a parameter but should be
-# part of the module's state_dict. For type checking we model it as returning Tensor.
-def Buffer[Shape: IntTuple](
-    data: Tensor[Shape], persistent: bool = True
-) -> Tensor[Shape]:
-    """
-    Wraps a tensor as a module buffer.
-    Returns the tensor (for type purposes) since operations on Buffers return Tensors.
-    """
-    ...
+class Buffer[Shape: IntTuple = IntTuple](Tensor[Shape]):
+    @overload
+    def __new__(cls, data: Tensor[Shape], persistent: bool = True) -> Tensor[Shape]: ...
+    @overload
+    def __new__(cls, data: None = None, persistent: bool = True) -> Tensor: ...
 
 # Linear layer
 class Linear[IN: IntVar, OUT: IntVar](Module):
@@ -177,7 +273,7 @@ class Embedding[NUM_EMB: IntVar, EMB_DIM: IntVar](Module):
 # ModuleDict
 class ModuleDict[T](Module):
     """Holds submodules in a dictionary"""
-    def __init__(self, modules: T) -> None: ...
+    def __init__(self, modules: T | None = None) -> None: ...
     def __getitem__(self, key: str) -> T: ...
     def __setitem__(self, key: str, module: Module) -> None: ...
     def __getattr__(self, name: str) -> T: ...  # Support attribute access
@@ -195,6 +291,7 @@ class Sequential[*Ms](Module):
     """
     def __init__(self, *args: *Ms) -> None: ...
     def forward(self, input: Tensor) -> Tensor: ...
+    def __iter__(self) -> Iterator[Module]: ...
 
 # ModuleList container
 class ModuleList[T](Module):
@@ -202,7 +299,10 @@ class ModuleList[T](Module):
     Holds modules in a list.
     """
     def __init__(self, modules: Iterable[T] | None = None) -> None: ...
+    @overload
     def __getitem__(self, idx: int) -> T: ...
+    @overload
+    def __getitem__(self, idx: slice) -> ModuleList[T]: ...
     def __iter__(self) -> Iterator[T]: ...
     def __len__(self) -> int: ...
     def append(self, module: T) -> None: ...
@@ -574,15 +674,16 @@ class Conv2d[
 class Conv3d[
     InC: IntVar,
     OutC: IntVar,
-    K: IntVar,
-    S: IntVar = 1,
-    P: IntVar = 0,
-    D: IntVar = 1,
+    K: IntVar = int,
+    S: IntVar = int,
+    P: IntVar = int,
+    D: IntVar = int,
 ](Module):
-    """3D convolution. Tracks channel and spatial dimensions.
+    """3D convolution with precise scalar-argument shape tracking.
 
     Type parameters S, P, D are bound from constructor arguments via _Int[T].
-    PEP 696 defaults (S=1, P=0, D=1) apply when arguments are omitted.
+    Omitted arguments use their precise scalar defaults. Tuple-valued dimensions
+    and string padding leave the corresponding spatial output dimensions gradual.
     """
 
     weight: Tensor[[OutC, InC, K, K, K]]
@@ -591,10 +692,10 @@ class Conv3d[
         self,
         in_channels: _Int[InC],
         out_channels: _Int[OutC],
-        kernel_size: _Int[K],
-        stride: _Int[S] = 1,
-        padding: _Int[P] = 0,
-        dilation: _Int[D] = 1,
+        kernel_size: _Int[K] | tuple[int, int, int],
+        stride: _Int[S] | tuple[int, int, int] = 1,
+        padding: _Int[P] | tuple[int, int, int] | str = 0,
+        dilation: _Int[D] | tuple[int, int, int] = 1,
         groups: int = 1,
         bias: bool = True,
         padding_mode: str = "zeros",
@@ -1015,6 +1116,7 @@ class GRU[
     HiddenSize: _Int,
     NumLayers: _Int = 1,
     Bidirectional: Flag[bool] = False,
+    BatchFirst: Flag[bool] = False,
 ](Module):
     """Gated Recurrent Unit RNN.
 
@@ -1033,7 +1135,7 @@ class GRU[
         hidden_size: HiddenSize,
         num_layers: NumLayers = 1,
         bias: bool = True,
-        batch_first: bool = False,
+        batch_first: BatchFirst = False,
         dropout: float = 0.0,
         bidirectional: Bidirectional = False,
     ) -> None: ...
@@ -1043,8 +1145,10 @@ class GRU[
     def forward[Shape: IntTuple](
         self, input: Tensor[Shape], hx: Tensor | None = None
     ) -> tuple[
-        Tensor[recurrent_output_shape(Shape, HiddenSize, Bidirectional)],
-        Tensor[recurrent_state_shape(Shape, HiddenSize, NumLayers, Bidirectional)],
+        Tensor[gru_output_shape(Shape, InputSize, HiddenSize, Bidirectional)],
+        Tensor[
+            gru_state_shape(Shape, HiddenSize, NumLayers, Bidirectional, BatchFirst)
+        ],
     ]: ...
 
 class GRUCell(Module):
@@ -1433,3 +1537,5 @@ __all__ = [
     "EmbeddingBag",
     "Upsample",
 ]
+
+def __getattr__(name: str) -> Any: ...

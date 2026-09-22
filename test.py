@@ -1,4 +1,4 @@
-#!/usr/bin/env fbpython
+#!/usr/bin/env python3
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
@@ -49,6 +49,7 @@ class TestFlags:
     run_tensor_shapes: bool
     run_conformance: bool
     run_jsonschema: bool
+    run_extension: bool
 
 
 def print_running(msg: str) -> None:
@@ -128,6 +129,25 @@ class Executor(abc.ABC):
     def jsonschema(self) -> None:
         raise NotImplementedError()
 
+    def extension(self) -> None:
+        """Test the VS Code extension's Python helper.
+
+        This is not abstract: `find_pyrefly.py` is a standalone stdlib script
+        shipped inside the extension and run by the user's own interpreter, so
+        neither build system produces it and the command is the same in both
+        modes.
+        """
+        run(
+            [
+                sys.executable,
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "lsp/resources/test",
+            ]
+        )
+
 
 @final
 class CargoExecutor(Executor):
@@ -192,9 +212,8 @@ class CargoExecutor(Executor):
         )
 
     def tensor_shapes(self) -> None:
-        # Static only, so that `test.py` needs no virtualenv. The runner builds
-        # the debug pyrefly itself, so we neither build here nor pass
-        # `--pyrefly`.
+        # The runner builds the debug pyrefly itself, so we neither build here
+        # nor pass `--pyrefly`.
         run([sys.executable, "tensor-shapes/run_tests.py", "--static-only"])
 
     def conformance(self) -> None:
@@ -261,8 +280,7 @@ class BuckExecutor(Executor):
             )
             return
         # Same runner and same scope as the Cargo path; `--buck` only changes
-        # where the Pyrefly binary comes from. Runtime tests are left to CI so
-        # that `test.py` does not require a bootstrapped virtualenv.
+        # where the Pyrefly binary comes from. Runtime tests are left to CI.
         run([sys.executable, "tensor-shapes/run_tests.py", "--static-only", "--buck"])
 
     def conformance(self) -> None:
@@ -318,6 +336,11 @@ def run_tests(executor: Executor, test_flags: TestFlags) -> None:
         print_running("jsonschema tests")
         with timing():
             executor.jsonschema()
+
+    if test_flags.run_extension:
+        print_running("extension tests")
+        with timing():
+            executor.extension()
 
 
 def get_executor(mode: str) -> Executor:
@@ -381,6 +404,12 @@ def invoke_main() -> None:
         default=True,
         help="Whether to run jsonschema test or not",
     )
+    parser.add_argument(
+        "--extension",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to run the VS Code extension's Python tests or not",
+    )
     args = parser.parse_args()
     try:
         main(
@@ -392,6 +421,7 @@ def invoke_main() -> None:
                 run_tensor_shapes=args.tensor_shapes,
                 run_conformance=args.conformance,
                 run_jsonschema=args.jsonschema,
+                run_extension=args.extension,
             ),
         )
     except KeyboardInterrupt:

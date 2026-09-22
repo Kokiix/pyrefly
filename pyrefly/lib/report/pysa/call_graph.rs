@@ -1627,8 +1627,8 @@ impl<'a> CallGraphVisitor<'a> {
                     // Use the bound of the type var as the base class.
                     self.receiver_class_from_type(bound, is_class_method)
                 }
-                Restriction::Flag(domain) => self.receiver_class_from_type(
-                    &domain.as_type(
+                Restriction::ShapeExtension(extension) => self.receiver_class_from_type(
+                    &extension.upper_bound(
                         &self.module_answers_context.stdlib,
                         self.module_answers_context.answers.heap(),
                     ),
@@ -3306,10 +3306,10 @@ impl<'a> CallGraphVisitor<'a> {
         let left_comparator_type = self
             .module_answers_context
             .answers
-            .get_type_trace(compare.comparators.first().unwrap().range());
+            .get_type_trace(compare.second_operand().range());
 
         let mut last_lhs_start = compare.range().start();
-        for (operator, right_comparator) in compare.ops.iter().zip(compare.comparators.iter()) {
+        for (operator, right_comparator) in compare.ops.iter().zip(compare.comparators()) {
             let callee_name = dunder::rich_comparison_dunder(*operator);
             let DunderAttrCallees { callees, .. } = self.call_targets_from_magic_dunder_attr(
                 /* base */ left_comparator_type.as_ref(),
@@ -4077,7 +4077,7 @@ impl<'a> CallGraphVisitor<'a> {
         let key = KeyDecoratedFunction(ShortIdentifier::new(&function_def.name));
         let callees = self
             .module_answers_context
-            .bindings
+            .bindings()
             .key_to_idx_hashed_opt(Hashed::new(&key))
             .and_then(|idx| {
                 let function = DecoratedFunction {

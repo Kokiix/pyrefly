@@ -494,15 +494,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
     ) -> Type {
         let Some(CallArg::Arg(obj_arg)) = args.first() else {
-            return self.freeform_call_infer(
-                replace_ty.clone(),
-                args,
-                kws,
-                callee_range,
-                arg_range,
-                hint,
-                errors,
-            );
+            return self
+                .freeform_call_infer(
+                    replace_ty.clone(),
+                    args,
+                    kws,
+                    callee_range,
+                    arg_range,
+                    hint,
+                    errors,
+                )
+                .ty;
         };
         let obj_ty = obj_arg.infer(self, errors);
 
@@ -575,15 +577,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let new_first_arg = self.unions(non_dataclasses);
             new_args.push(CallArg::ty(&new_first_arg, obj_arg.range()));
             new_args.extend(args.iter().skip(1).cloned());
-            rets.push(self.freeform_call_infer(
-                replace_ty.clone(),
-                &new_args,
-                kws,
-                callee_range,
-                arg_range,
-                hint,
-                errors,
-            ));
+            rets.push(
+                self.freeform_call_infer(
+                    replace_ty.clone(),
+                    &new_args,
+                    kws,
+                    callee_range,
+                    arg_range,
+                    hint,
+                    errors,
+                )
+                .ty,
+            );
         }
         self.unions(rets)
     }
@@ -658,6 +663,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             hint,
             errors,
         )
+        .ty
     }
 
     fn get_dataclass_replace(
@@ -1088,7 +1094,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .finish_class_targs(class_type.targs_mut(), self.uniques);
         // Finalizing the fresh vars is required; its specialization errors are dropped because this
         // is best-effort param inference with no call site to report them against.
-        let _ = self.finish_quantified(vs, self.solver().infer_with_first_use);
+        let _ = self.finish_quantified(vs, self.solver().config.infer_with_first_use);
         matched.then(|| self.heap.mk_type_of(self.heap.mk_class_type(class_type)))
     }
 
@@ -1109,7 +1115,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if let Some(ret) = instantiated.callable_return_type(self.heap) {
             self.is_subset_eq(&ret, hint);
         }
-        let _ = self.finish_quantified(vs, self.solver().infer_with_first_use);
+        let _ = self.finish_quantified(vs, self.solver().config.infer_with_first_use);
         Some(self.solver().expand(instantiated))
     }
 

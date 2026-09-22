@@ -359,6 +359,11 @@ const config: Config = {
                   component: '@site/src/pages/landingPage.tsx',
                   exact: true,
                 });
+                addRoute({
+                  path: '/pycontw2026',
+                  component: '@site/src/pages/landingPage.tsx',
+                  exact: true,
+                });
                 // Short vanity URL surfaced from the VS Code extension's
                 // status-bar tooltip and the CLI upsell. Points users at
                 // the install/onboarding docs.
@@ -490,7 +495,7 @@ const config: Config = {
                         },
                         {
                             label: 'Bluesky',
-                            href: 'https://bsky.app/profile/pyrefly-dev.bsky.social',
+                            href: 'https://bsky.app/profile/pyrefly.org',
                         },
                         {
                             label: 'Mastodon',
@@ -543,6 +548,12 @@ const config: Config = {
                     beforeDefaultRemarkPlugins: [
                         [remarkSandboxPlugin, {
                             sandboxExamplesDir: path.resolve(__dirname, 'sandbox-examples'),
+                            sourceDirectories: {
+                                microtorch: path.resolve(__dirname, '../tensor-shapes/microtorch/examples'),
+                            },
+                            sharedDirectories: {
+                                microtorch: path.resolve(__dirname, '../tensor-shapes/microtorch'),
+                            },
                         }],
                     ],
                 },

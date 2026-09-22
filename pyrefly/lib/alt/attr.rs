@@ -256,6 +256,13 @@ enum Attribute {
     ModuleFallback(NotFoundOn, ModuleName, Type),
 }
 
+/// How to fold one attribute per base into a single attribute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Combine {
+    Intersect,
+    Overloaded,
+}
+
 #[derive(Clone, Debug)]
 enum NotFoundOn {
     ClassInstance(Class, AttributeBase1),
@@ -279,7 +286,8 @@ pub enum NoAccessReason {
     SuperMethodNeedsImplementation(Class),
     /// A proxy method was accessed on the class object rather than an instance.
     ProxyMethodClassAccess(Class),
-    /// A proxy method declaration exists, but its target cannot be used as an instance method.
+    /// A proxy method declaration exists, but its target is neither an ordinary instance method
+    /// nor a class attribute whose type is callable.
     ProxyMethodTargetInvalid { class: Class, target: Name },
 }
 
@@ -501,7 +509,13 @@ enum AttributeBase1 {
     /// A parameterized class object, which exposes attributes from both `GenericAlias` and its
     /// origin class using runtime lookup precedence.
     GenericAlias(ClassBase),
-    Intersect(Vec<AttributeBase1>, Vec<AttributeBase1>),
+    /// Several bases describing one value, plus a fallback for when their attributes cannot be
+    /// combined. `Combine` says how to fold the per-base results together.
+    Composite {
+        bases: Vec<AttributeBase1>,
+        fallback: Vec<AttributeBase1>,
+        combine: Combine,
+    },
     /// Bound methods prefer exposing builtin `types.MethodType` attributes but fall back to the
     /// underlying function's attributes when the builtin ones are missing.
     BoundMethod(BoundMethodType),
@@ -609,6 +623,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let mut error_messages = Vec::new();
         let mut success = true;
         let (found, not_found, error) = lookup_result.decompose();
+        if found.is_empty()
+            && let Some(ty) = self.django_annotated_fields(base).get(attr_name).cloned()
+        {
+            return ty;
+        }
         // Check if we have a partial union failure (attribute exists on some union members
         // but not others) before consuming the vectors. This helps us decide whether to suggest.
         let is_partial_union_failure = !found.is_empty() && !not_found.is_empty();
@@ -733,7 +752,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 self.add_class_fields(self.stdlib.generic_alias().class_object(), candidates);
                 self.add_class_fields(origin.class_object(), candidates);
             }
-            AttributeBase1::Intersect(options, fallback) => {
+            AttributeBase1::Composite {
+                bases: options,
+                fallback,
+                ..
+            } => {
                 for b in options {
                     self.collect_attribute_candidates_from_base(b, candidates);
                 }
@@ -1634,6 +1657,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     fn fold_attribute_candidates(
         &self,
         candidates: &[Vec<(Attribute, AttributeBase1)>],
+        combine: Combine,
     ) -> Option<(Attribute, AttributeBase1)> {
         let [(_, found_on)] = candidates.first()?.as_slice() else {
             return None;
@@ -1664,7 +1688,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             };
             types.push(ty.clone());
         }
-        let combined = intersect(types, Type::any_implicit(), self.heap);
+        let combined = match combine {
+            Combine::Intersect => intersect(types, Type::any_implicit(), self.heap),
+            Combine::Overloaded => Type::combine_overload_results(types, self.heap)?,
+        };
         let attribute = if is_class_attribute {
             match read_only_reason {
                 Some(reason) => {
@@ -1722,9 +1749,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 let metadata = self.get_metadata_for_class(tensor.base_class.class_object());
                 match self.get_shaped_array_attribute(tensor, attr_name) {
                     Some(attr) => acc.found_class_attribute(attr, base),
-                    None if metadata.has_base_any() => {
-                        acc.found_type(Type::Any(AnyStyle::Implicit), base)
-                    }
+                    None if metadata.has_base_any() => acc.found_type(Type::any_implicit(), base),
                     None => acc.not_found(NotFoundOn::ClassInstance(
                         tensor.base_class.class_object().dupe(),
                         base,
@@ -2071,7 +2096,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     self.lookup_attr_static1(generic_alias, attr_name, acc);
                 }
             }
-            AttributeBase1::Intersect(bases, fallback) => {
+            AttributeBase1::Composite {
+                bases,
+                fallback,
+                combine,
+            } => {
                 let mut candidates = Vec::new();
                 for b in bases {
                     let mut acc_candidate = LookupResult::empty();
@@ -2083,7 +2112,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
                 if candidates.len() == 1 {
                     acc.found.extend(candidates.into_iter().next().unwrap());
-                } else if let Some(folded) = self.fold_attribute_candidates(candidates.as_slice()) {
+                } else if let Some(folded) =
+                    self.fold_attribute_candidates(candidates.as_slice(), *combine)
+                {
                     acc.found.push(folded);
                 } else {
                     // Properties and descriptors require access-specific resolution, so use the
@@ -2137,6 +2168,33 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         metaclass.class_object().clone(),
                         base,
                     )),
+                }
+            }
+            AttributeBase1::GenericAlias(origin) => {
+                let generic_alias =
+                    AttributeBase1::ClassInstance(self.stdlib.generic_alias().clone());
+                let origin = AttributeBase1::ClassObject(origin.clone());
+                let mut candidates = Vec::new();
+                let inherited_from_object = self.field_is_inherited_from(
+                    self.stdlib.generic_alias().class_object(),
+                    dunder_name,
+                    ("builtins", "object"),
+                );
+                for (b, exclude) in [(&generic_alias, inherited_from_object), (&origin, false)] {
+                    if exclude {
+                        continue;
+                    }
+                    let mut acc_candidate = LookupResult::empty();
+                    self.lookup_magic_dunder_attr1(b.clone(), dunder_name, &mut acc_candidate);
+                    if acc_candidate.not_found.is_empty() && acc_candidate.internal_error.is_empty()
+                    {
+                        candidates.push(acc_candidate.found);
+                    }
+                }
+                if candidates.len() == 1 {
+                    acc.found.extend(candidates.into_iter().next().unwrap());
+                } else {
+                    self.lookup_magic_dunder_attr1(generic_alias, dunder_name, acc);
                 }
             }
             AttributeBase1::ClassInstance(cls)
@@ -2438,7 +2496,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // recomputes this projection; that duplicate lookup is bounded by the cheap
         // syntactic pre-filter above, so it only runs for plausible shaped arrays.
         let shape_arg = self.shaped_array_shape_arg(cls)?;
-        self.shaped_array_shape_arg_to_shape(&shape_arg)?;
+        self.shape_arg_to_int_tuple(&shape_arg)?;
         Some(self.shaped_array_classtype_to_shaped_array_type(cls))
     }
 
@@ -2566,9 +2624,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Type::Callable(c) if matches!(c.params, Params::Partial(_)) => acc.push(
                 AttributeBase1::ClassInstance(self.stdlib.partial(c.ret.clone())),
             ),
-            Type::Callable(_) | Type::CallableResidual(_) => acc.push(
-                AttributeBase1::ClassInstance(self.stdlib.function_type().clone()),
-            ),
+            Type::Callable(_) => acc.push(AttributeBase1::ClassInstance(
+                self.stdlib.function_type().clone(),
+            )),
             Type::KwCall(call) => self.as_attribute_base1(call.return_ty, acc),
             Type::Function(f) => acc.push(AttributeBase1::ClassInstance(
                 if let FunctionKind::CallbackProtocol(cls) = f.metadata.kind {
@@ -2649,20 +2707,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ));
                     }
                 }
-                Restriction::Flag(domain) => {
-                    // Every materialized Flag domain member has an attribute base. Neither the
-                    // generic `object` fallback nor an empty result would be correct here.
-                    for ty in domain.types(self.stdlib) {
+                Restriction::ShapeExtension(extension) => {
+                    // Every materialized shape-extension bound member has an attribute base.
+                    // Neither the generic `object` fallback nor an empty result is correct here.
+                    for ty in extension.upper_bound_members(self.stdlib) {
                         let base = self
                             .as_attribute_base(ty)
-                            .expect("Flag domain members have attribute bases");
+                            .expect("shape-extension bound members have attribute bases");
                         for base1 in base.0 {
                             acc.push(
                                 self.attribute_base_for_bounded_quantified(
                                     (*quantified).clone(),
                                     base1,
                                 )
-                                .expect("Flag domain members have class-instance bases"),
+                                .expect(
+                                    "shape-extension upper-bound members have class-instance bases",
+                                ),
                             );
                         }
                     }
@@ -2677,6 +2737,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             {
                 acc.push(AttributeBase1::Quantified(q.clone(), cls.clone()));
             }
+            Type::Overloaded(branches) => {
+                let mut acc_branches = Vec::new();
+                for t in branches.into_iter() {
+                    self.as_attribute_base1(t, &mut acc_branches);
+                }
+                acc.push(AttributeBase1::Composite {
+                    bases: acc_branches,
+                    fallback: Vec::new(),
+                    combine: Combine::Overloaded,
+                });
+            }
             Type::Intersect(x) => {
                 let mut acc_intersect = Vec::new();
                 for t in x.0 {
@@ -2684,7 +2755,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
                 let mut acc_fallback = Vec::new();
                 self.as_attribute_base1(x.1, &mut acc_fallback);
-                acc.push(AttributeBase1::Intersect(acc_intersect, acc_fallback));
+                acc.push(AttributeBase1::Composite {
+                    bases: acc_intersect,
+                    fallback: acc_fallback,
+                    combine: Combine::Intersect,
+                });
             }
             Type::ElementOfTypeVarTuple(_) => {
                 acc.push(AttributeBase1::ClassInstance(self.stdlib.object().clone()))
@@ -2694,9 +2769,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Type::Annotated(_, _) => acc.push(AttributeBase1::ClassInstance(
                 self.stdlib.generic_alias().clone(),
             )),
+            Type::TypeForm(_) => {
+                acc.push(AttributeBase1::ClassInstance(self.stdlib.object().clone()))
+            }
             // TODO: check to see which ones should have class representations
             Type::SpecialForm(_)
-            | Type::TypeForm(_)
             | Type::TypeLevelDslCall(_)
             | Type::Unpack(_)
             | Type::Concatenate(_, _)
@@ -2806,17 +2883,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         )));
                     }
                 }
-                Restriction::Flag(domain) => {
-                    // Every materialized Flag domain member has a class-instance base. Neither
-                    // the generic `object` fallback nor an empty result would be correct here.
-                    for ty in domain.types(self.stdlib) {
+                Restriction::ShapeExtension(extension) => {
+                    // Every materialized shape-extension bound member has a class-instance base.
+                    // Neither the generic `object` fallback nor an empty result is correct here.
+                    for ty in extension.upper_bound_members(self.stdlib) {
                         let base = self
                             .as_attribute_base(ty)
-                            .expect("Flag domain members have attribute bases");
+                            .expect("shape-extension bound members have attribute bases");
                         for base1 in base.0 {
-                            let cls = self
-                                .quantified_bound_class(base1)
-                                .expect("Flag domain members have class-instance bases");
+                            let cls = self.quantified_bound_class(base1).expect(
+                                "shape-extension upper-bound members have class-instance bases",
+                            );
                             acc.push(AttributeBase1::ClassObject(ClassBase::Quantified(
                                 (*quantified).clone(),
                                 cls,
@@ -2893,12 +2970,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Type::None => acc.push(AttributeBase1::ClassObject(ClassBase::ClassType(
                 self.stdlib.none_type().clone(),
             ))),
-            Type::Function(_)
-            | Type::Callable(_)
-            | Type::CallableResidual(_)
-            | Type::Overload(_) => acc.push(AttributeBase1::ClassObject(ClassBase::ClassType(
-                self.stdlib.function_type().clone(),
-            ))),
+            Type::Function(_) | Type::Callable(_) | Type::Overload(_) => {
+                acc.push(AttributeBase1::ClassObject(ClassBase::ClassType(
+                    self.stdlib.function_type().clone(),
+                )))
+            }
             Type::Forall(forall)
                 if matches!(
                     forall.body,
@@ -3026,6 +3102,8 @@ pub enum AttrDefinition {
     Submodule {
         module_name: ModuleName,
     },
+    /// An attribute synthesized from a call-site argument and without a source definition.
+    Synthetic,
 }
 
 #[derive(Debug)]
@@ -3310,7 +3388,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 );
                 self.completions_class(origin.class_object(), expected_attribute_name, res);
             }
-            AttributeBase1::Intersect(bases, _) => {
+            AttributeBase1::Composite { bases, .. } => {
                 for b in bases {
                     self.completions_inner1(b, expected_attribute_name, res);
                 }
@@ -3325,9 +3403,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         expected_attribute_name: Option<&Name>,
         include_types: bool,
     ) -> Vec<AttrInfo> {
+        let annotated_fields = self.django_annotated_fields(&base);
         let mut res = Vec::new();
         if let Some(base) = self.as_attribute_base(base) {
             self.completions_inner(base, expected_attribute_name, include_types, &mut res);
+        }
+        for (name, ty) in annotated_fields {
+            if expected_attribute_name.is_none_or(|expected| expected == &name)
+                && !res.iter().any(|info| info.name == name)
+            {
+                res.push(AttrInfo {
+                    name,
+                    ty: include_types.then_some(ty),
+                    is_deprecated: false,
+                    definition: AttrDefinition::Synthetic,
+                    is_reexport: false,
+                });
+            }
         }
         res
     }

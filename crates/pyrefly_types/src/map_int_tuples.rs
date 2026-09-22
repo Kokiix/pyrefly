@@ -191,6 +191,24 @@ impl MapIntTuples {
         shadowed.truncate(old_len);
         self.mapper.refresh_normalized_body();
     }
+
+    /// Recurses through the operation while respecting the mapper's bound parameter.
+    pub(crate) fn visit_parts<'a>(
+        &'a self,
+        shadowed: &mut Vec<&'a Quantified>,
+        f: &mut dyn FnMut(&'a Type, &mut Vec<&'a Quantified>),
+    ) {
+        f(&self.source, shadowed);
+        if let MapIntTuplesInterpretation::ParameterPattern { mapped_member } = &self.interpretation
+        {
+            f(mapped_member, shadowed);
+        }
+        self.mapper.parameter.recurse(&mut |ty| f(ty, shadowed));
+        let old_len = shadowed.len();
+        shadowed.push(&self.mapper.parameter);
+        f(&self.mapper.body, shadowed);
+        shadowed.truncate(old_len);
+    }
 }
 
 impl TypeLevelDslCall {
@@ -595,7 +613,7 @@ mod tests {
     #[test]
     fn maps_union_with_gradual_source() {
         let exact_source = Type::concrete_tuple(vec![int_tuple(&[1])]);
-        let gradual_source = Type::Any(AnyStyle::Implicit);
+        let gradual_source = Type::any_implicit();
         let call = TypeLevelDslCall::map_int_tuples(
             identity_lambda(),
             Type::union(vec![exact_source, gradual_source]),
@@ -671,12 +689,11 @@ mod tests {
 
     #[test]
     fn alpha_equivalent_maps_have_equal_identity() {
-        let left =
-            TypeLevelDslCall::map_int_tuples(identity_lambda(), Type::Any(AnyStyle::Implicit));
+        let left = TypeLevelDslCall::map_int_tuples(identity_lambda(), Type::any_implicit());
         let parameter = binder("Renamed", 2);
         let right = TypeLevelDslCall::map_int_tuples(
             TypeLambda::new(parameter.clone(), Type::Quantified(Box::new(parameter))),
-            Type::Any(AnyStyle::Implicit),
+            Type::any_implicit(),
         );
 
         assert!(left.type_eq(&right, &mut TypeEqCtx::default()));
@@ -699,11 +716,11 @@ mod tests {
                     Type::Quantified(Box::new(second)),
                 ]),
             ),
-            Type::Any(AnyStyle::Implicit),
+            Type::any_implicit(),
         );
         TypeLevelDslCall::map_int_tuples(
             TypeLambda::new(outer, Type::TypeLevelDslCall(Box::new(inner_map))),
-            Type::Any(AnyStyle::Implicit),
+            Type::any_implicit(),
         )
     }
 
@@ -753,15 +770,14 @@ mod tests {
         );
         assert_eq!(lambda, expected);
 
-        let left = TypeLevelDslCall::map_int_tuples(lambda, Type::Any(AnyStyle::Implicit));
-        let right = TypeLevelDslCall::map_int_tuples(expected, Type::Any(AnyStyle::Implicit));
+        let left = TypeLevelDslCall::map_int_tuples(lambda, Type::any_implicit());
+        let right = TypeLevelDslCall::map_int_tuples(expected, Type::any_implicit());
         assert_eq!(hash(&left), hash(&right));
     }
 
     #[test]
     fn parameter_pattern_fallback_uses_its_mapped_member() {
-        let mut pattern =
-            TypeLevelDslCall::map_int_tuples(identity_lambda(), Type::Any(AnyStyle::Implicit));
+        let mut pattern = TypeLevelDslCall::map_int_tuples(identity_lambda(), Type::any_implicit());
         let member = int_tuple(&[1]);
         let view = Type::unbounded_tuple(member.clone());
         let forward = pattern.clone();

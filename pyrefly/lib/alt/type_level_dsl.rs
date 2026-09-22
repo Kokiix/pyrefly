@@ -642,11 +642,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     TypeShapeDslExpressionKind::Einsum {
                         parameter_origins: Some(parameters),
                         ..
+                    }
+                    | TypeShapeDslExpressionKind::EinopsEinsum {
+                        parameter_origins: Some(parameters),
+                        ..
                     } => (!parameters.iter().all(|parameter| {
                         parameter_domains[*parameter]
                             == TypeShapeDslInputDomain::Value(TypeShapeDslDomain::IntTuples)
                     }))
                     .then_some("`@type_shape_dsl_function` einsum operands must be annotated as `IntTuples`"),
+                    TypeShapeDslExpressionKind::GufuncBroadcast {
+                        parameter_origins: Some(parameters),
+                        ..
+                    } => (!parameters.iter().all(|parameter| {
+                        parameter_domains[*parameter]
+                            == TypeShapeDslInputDomain::Value(TypeShapeDslDomain::IntTuples)
+                    }))
+                    .then_some("`@type_shape_dsl_function` gufunc operands must be annotated as `IntTuples`"),
                     TypeShapeDslExpressionKind::FlagValueSlot {
                         parameter_uses: Some(uses),
                         required,
@@ -691,6 +703,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     | TypeShapeDslExpressionKind::IntTupleSlice
                     | TypeShapeDslExpressionKind::IntTupleConcat
                     | TypeShapeDslExpressionKind::Einsum { .. }
+                    | TypeShapeDslExpressionKind::EinopsEinsum { .. }
+                    | TypeShapeDslExpressionKind::Rearrange
+                    | TypeShapeDslExpressionKind::Reduce
+                    | TypeShapeDslExpressionKind::Repeat
+                    | TypeShapeDslExpressionKind::GufuncBroadcast { .. }
                     | TypeShapeDslExpressionKind::IntTupleConstructor
                     | TypeShapeDslExpressionKind::IntTuplesConstructor
                     | TypeShapeDslExpressionKind::IntTupleProduct
@@ -824,29 +841,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             valid_body = false;
                         }
                     }
-                    TypeShapeDslReturnKind::Broadcast {
-                        left_parameters,
-                        right_parameters,
-                        ..
-                    } if result != TypeShapeDslDomain::IntTuple
-                        || !left_parameters.iter().all(|parameter| {
-                            parameter_domains[*parameter]
-                                == TypeShapeDslInputDomain::Value(TypeShapeDslDomain::IntTuple)
-                        })
-                        || !right_parameters.iter().all(|parameter| {
-                            parameter_domains[*parameter]
-                                == TypeShapeDslInputDomain::Value(TypeShapeDslDomain::IntTuple)
-                        }) =>
-                    {
-                        self.error(
-                            errors,
-                            return_.range(),
-                            ErrorKind::InvalidArgument,
-                            "`@type_shape_dsl_function` broadcast return requires two `IntTuple` parameters and an `IntTuple` result"
-                                .to_owned(),
-                        );
-                        valid_body = false;
-                    }
                     TypeShapeDslReturnKind::Gradual(domain) if *domain != result => {
                         self.error(
                             errors,
@@ -874,7 +868,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         valid_body = false;
                     }
                     TypeShapeDslReturnKind::Slot { .. }
-                    | TypeShapeDslReturnKind::Broadcast { .. }
                     | TypeShapeDslReturnKind::Expression(_)
                     | TypeShapeDslReturnKind::Invalid
                     | TypeShapeDslReturnKind::HelperCall(_)
@@ -960,9 +953,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let FunctionKind::Def(id) = function_kind else {
             return None;
         };
-        if id.has_toplevel_qname("shape_extensions", "broadcast") {
-            return Some(TypeShapeDslIntrinsic::Broadcast);
-        }
         if id.has_toplevel_qname("builtins", "any") {
             return Some(TypeShapeDslIntrinsic::Any);
         }
@@ -989,6 +979,21 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         if id.has_toplevel_qname("shape_extensions.dsl", "einsum") {
             return Some(TypeShapeDslIntrinsic::Einsum);
+        }
+        if id.has_toplevel_qname("shape_extensions.dsl", "einops_einsum") {
+            return Some(TypeShapeDslIntrinsic::EinopsEinsum);
+        }
+        if id.has_toplevel_qname("shape_extensions.dsl", "rearrange") {
+            return Some(TypeShapeDslIntrinsic::Rearrange);
+        }
+        if id.has_toplevel_qname("shape_extensions.dsl", "reduce") {
+            return Some(TypeShapeDslIntrinsic::Reduce);
+        }
+        if id.has_toplevel_qname("shape_extensions.dsl", "repeat") {
+            return Some(TypeShapeDslIntrinsic::Repeat);
+        }
+        if id.has_toplevel_qname("shape_extensions.dsl", "_gufunc_broadcast") {
+            return Some(TypeShapeDslIntrinsic::GufuncBroadcast);
         }
         let class = id.cls.as_ref()?;
         if id.qname.id().as_str() != "gradual" {
@@ -1018,9 +1023,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Some(CalleeKind::Function(FunctionKind::TypeShapeDsl(_, function))) => self
                 .parse_user_defined_type_level_dsl_call(call, function, type_form_context, errors),
             Some(CalleeKind::Function(FunctionKind::Def(id)))
-                if id.has_toplevel_qname("shape_extensions", "broadcast") =>
+                if id.has_toplevel_qname("shape_extensions", "index_shape") =>
             {
-                self.parse_broadcast_type_level_dsl_call(call, type_form_context, errors)
+                self.parse_index_shape_type_level_dsl_call(call, type_form_context, errors)
             }
             _ => self.error(
                 errors,
@@ -1242,62 +1247,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
-    fn parse_broadcast_type_level_dsl_call(
-        &self,
-        call: &ExprCall,
-        type_form_context: TypeFormContext<'_>,
-        errors: &ErrorCollector,
-    ) -> Type {
-        if !call.arguments.keywords.is_empty() {
-            return self.error(
-                errors,
-                call.range(),
-                ErrorKind::InvalidAnnotation,
-                "`broadcast` does not accept keyword arguments".to_owned(),
-            );
-        }
-        if call.arguments.args.len() != 2 {
-            return self.error(
-                errors,
-                call.range(),
-                ErrorKind::InvalidAnnotation,
-                format!(
-                    "Expected 2 arguments for `broadcast`, got {}",
-                    call.arguments.args.len()
-                ),
-            );
-        }
-
-        let argument_context = TypeFormContext::TypeArgument(&type_form_context);
-        let args: Vec<_> = call
-            .arguments
-            .args
-            .iter()
-            .map(|arg| {
-                let ty = self.expr_untype(arg, argument_context, errors);
-                if ty.is_error() {
-                    ty
-                } else if !self.is_int_tuple_dsl_argument(&ty) {
-                    self.error(
-                        errors,
-                        arg.range(),
-                        ErrorKind::InvalidAnnotation,
-                        format!(
-                            "Expected an `IntTuple` argument to `broadcast`, got `{}`",
-                            self.for_display(ty.clone())
-                        ),
-                    )
-                } else {
-                    ty
-                }
-            })
-            .collect();
-        if args.iter().any(Type::is_error) {
-            return Type::any_error();
-        }
-        Type::TypeLevelDslCall(Box::new(TypeLevelDslCall::broadcast(args)))
-    }
-
     pub(crate) fn is_int_tuple_dsl_argument(&self, ty: &Type) -> bool {
         let restriction = match ty {
             Type::Any(_) | Type::IntTuple(_) => return true,
@@ -1316,7 +1265,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         .iter()
                         .all(|constraint| matches!(constraint, Type::IntTuple(_)))
             }
-            Restriction::Flag(_) => false,
+            Restriction::ShapeExtension(_) => false,
             Restriction::Unrestricted => false,
         }
     }
@@ -1337,7 +1286,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Restriction::Constraints(constraints) => {
                 !constraints.is_empty() && constraints.iter().all(is_int_tuples_type)
             }
-            Restriction::Flag(_) | Restriction::Unrestricted => false,
+            Restriction::ShapeExtension(_) | Restriction::Unrestricted => false,
         }
     }
 

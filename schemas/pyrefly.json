@@ -54,6 +54,14 @@
           },
           "default": []
         },
+        "replace-untyped-imports-with-any": {
+          "description": "Instruct Pyrefly to replace the given module globs with typing.Any when the installed third-party package provides neither stubs nor a py.typed marker.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
         "ignore-errors-in-generated-code": {
           "description": "Whether to ignore type errors in generated code. If enabled, generated files will be treated as if they are included in project-excludes. The generated code status is determined by checking if the file contents contain the substring '@generated'.",
           "type": "boolean",
@@ -64,8 +72,8 @@
           "type": "boolean",
           "default": true
         },
-        "check-all-matches": {
-          "description": "Whether to check every match statement for exhaustiveness instead of limiting checks to closed subject types.",
+        "jaxtyping": {
+          "description": "Whether to interpret jaxtyping annotations as tensor shapes.",
           "type": "boolean",
           "default": false
         },
@@ -238,6 +246,18 @@
           "type": "string",
           "enum": ["ignore", "info", "warn", "error"],
           "default": "ignore"
+        },
+        "baseline-matching-mode": {
+          "description": "Fields used to match diagnostics against baseline entries.",
+          "type": "string",
+          "enum": ["column", "concise-description"],
+          "default": "column"
+        },
+        "baseline-format": {
+          "description": "Amount of diagnostic information written to the baseline file.",
+          "type": "string",
+          "enum": ["full", "minimal"],
+          "default": "full"
         },
         "build-system": {
           "description": "Pyrefly supports integrating into build systems to discover targets to type check and their dependencies. Currently supports Buck2 and custom queries.",

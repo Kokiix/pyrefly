@@ -37,6 +37,9 @@ use percent_encoding::CONTROLS;
 use percent_encoding::utf8_percent_encode;
 use pyrefly_build::handle::Handle;
 use pyrefly_config::args::ConfigOverrideArgs;
+use pyrefly_config::base::Preset;
+use pyrefly_config::config::BaselineFormat;
+use pyrefly_config::config::BaselineMatchingMode;
 use pyrefly_config::config::ConfigFile;
 use pyrefly_config::config::OutputFormat;
 use pyrefly_config::config::SynthesizedPresetReason;
@@ -584,6 +587,12 @@ impl OutputArgs {
                 .baseline_error_level
                 .or_else(|| config.and_then(|config| config.baseline_error_level))
                 .unwrap_or(Severity::Ignore),
+            baseline_matching_mode: config
+                .map(|config| config.baseline_matching_mode)
+                .unwrap_or_default(),
+            baseline_format: config
+                .map(|config| config.baseline_format)
+                .unwrap_or_default(),
             output_format: self
                 .output_format
                 .or_else(|| config.and_then(|config| config.output_format))
@@ -613,6 +622,8 @@ impl OutputArgs {
 struct OutputDefaults {
     baseline: Option<PathBuf>,
     baseline_error_level: Severity,
+    baseline_matching_mode: BaselineMatchingMode,
+    baseline_format: BaselineFormat,
     output_format: OutputFormat,
     min_severity: Severity,
 }
@@ -834,7 +845,10 @@ fn write_error_json_to_file(
         .with_context(|| format!("while writing JSON errors to `{}`", path.display()))
 }
 
-fn write_baseline_errors_to_file(path: &Path, errors: &BaselineErrors) -> anyhow::Result<()> {
+fn write_formatted_baseline_errors_to_file(
+    path: &Path,
+    errors: &BaselineErrors,
+) -> anyhow::Result<()> {
     fn f(path: &Path, errors: &BaselineErrors) -> anyhow::Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
         serde_json::to_writer_pretty(&mut writer, errors)?;
@@ -844,8 +858,17 @@ fn write_baseline_errors_to_file(path: &Path, errors: &BaselineErrors) -> anyhow
     f(path, errors).with_context(|| format!("while writing baseline to `{}`", path.display()))
 }
 
-fn write_baseline_to_file(path: &Path, relative_to: &Path, errors: &[Error]) -> anyhow::Result<()> {
-    write_baseline_errors_to_file(path, &BaselineErrors::from_errors(relative_to, errors))
+fn write_baseline_errors_to_file(
+    path: &Path,
+    relative_to: &Path,
+    errors: &[Error],
+    matching_mode: BaselineMatchingMode,
+    format: BaselineFormat,
+) -> anyhow::Result<()> {
+    write_formatted_baseline_errors_to_file(
+        path,
+        &BaselineErrors::from_errors(relative_to, errors).with_format(matching_mode, format),
+    )
 }
 
 fn write_error_json_to_console(relative_to: &Path, errors: &[Error]) -> anyhow::Result<()> {
@@ -1162,7 +1185,7 @@ impl Handles {
         }
 
         // TODO(connernilsen): wire in force logic
-        let reloaded_source_dbs = ConfigFile::query_source_db(&configs, false, None).0;
+        let reloaded_source_dbs = ConfigFile::query_source_db(&configs, false, None).reloaded;
         let result = configs
             .iter()
             .flat_map(|(c, files)| files.iter().map(|p| c.handle_from_module_path(p.dupe())))
@@ -1205,12 +1228,6 @@ async fn get_watcher_events(watcher: &mut Watcher) -> anyhow::Result<Categorized
         );
         if !events.is_empty() {
             return Ok(events);
-        }
-        if !events.unknown.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Cannot handle uncategorized watcher event on paths [{}]",
-                display::commas_iter(|| events.unknown.iter().map(|x| x.display()))
-            ));
         }
     }
 }
@@ -1316,16 +1333,22 @@ fn write_unconfigured_upsell<W: Write>(
         SynthesizedPresetReason::Migrated(kind) => {
             let (location, preset) = match kind {
                 MigratedFromKind::Mypy(MigratedConfigSource::DedicatedFile) => {
-                    ("your `mypy.ini`", "legacy")
+                    ("your `mypy.ini`", Preset::Legacy)
                 }
                 MigratedFromKind::Mypy(MigratedConfigSource::PyprojectToml) => {
-                    ("`[tool.mypy]` in your `pyproject.toml`", "legacy")
+                    ("`[tool.mypy]` in your `pyproject.toml`", Preset::Legacy)
                 }
                 MigratedFromKind::Pyright(MigratedConfigSource::DedicatedFile) => {
-                    ("your `pyrightconfig.json`", "default")
+                    ("your `pyrightconfig.json`", Preset::Default)
                 }
                 MigratedFromKind::Pyright(MigratedConfigSource::PyprojectToml) => {
-                    ("`[tool.pyright]` in your `pyproject.toml`", "default")
+                    ("`[tool.pyright]` in your `pyproject.toml`", Preset::Default)
+                }
+                MigratedFromKind::BasedPyright(MigratedConfigSource::DedicatedFile, _) => {
+                    unreachable!("no such thing as basedpyrightconfig.json")
+                }
+                MigratedFromKind::BasedPyright(MigratedConfigSource::PyprojectToml, preset) => {
+                    ("`[tool.basedpyright]` in your `pyproject.toml`", preset)
                 }
             };
             writeln!(
@@ -1454,6 +1477,32 @@ impl IncrementalChecker {
         events: &CategorizedEvents,
         additional_files: &[PathBuf],
     ) -> IncrementalCheckTransaction<'_> {
+        let resolved_events;
+        let events = if events.unknown.is_empty() {
+            events
+        } else {
+            // Handles need explicit creation and removal events. Classifying an existing
+            // file as modified also avoids invalidating module lookup unnecessarily.
+            let mut resolved = CategorizedEvents {
+                created: events.created.clone(),
+                modified: events.modified.clone(),
+                removed: events.removed.clone(),
+                unknown: Vec::new(),
+            };
+            for path in &events.unknown {
+                let module_path = ModulePath::filesystem(path.clone());
+                if !path.exists() {
+                    resolved.removed.push(path.clone());
+                } else if self.handles.path_data.contains(&module_path) {
+                    resolved.modified.push(path.clone());
+                } else {
+                    resolved.created.push(path.clone());
+                }
+            }
+            resolved_events = resolved;
+            &resolved_events
+        };
+
         let mut transaction = self
             .state
             .new_committable_transaction(self.require_levels.default, None);
@@ -1889,6 +1938,7 @@ impl CheckArgs {
             &mut collected,
             defaults.baseline.as_deref(),
             relative_to.as_path(),
+            defaults.baseline_matching_mode,
             self.output.prune_baseline || self.output.error_stale_baseline,
         );
 
@@ -1997,13 +2047,20 @@ impl CheckArgs {
                     error.error_kind(),
                 )
             });
-            write_baseline_to_file(baseline_path, relative_to.as_path(), &new_baseline)?;
+            write_baseline_errors_to_file(
+                baseline_path,
+                relative_to.as_path(),
+                &new_baseline,
+                defaults.baseline_matching_mode,
+                defaults.baseline_format,
+            )?;
         } else if rewriting_baseline {
             let baseline_path = defaults
                 .baseline
                 .as_ref()
                 .expect("a baseline action requires a baseline path");
-            write_baseline_errors_to_file(
+            // Pruning removes entries and preserves the format of remaining ones.
+            write_formatted_baseline_errors_to_file(
                 baseline_path,
                 &BaselineErrors {
                     errors: retained_baseline_entries,
@@ -2133,7 +2190,16 @@ impl CheckArgs {
                 if hidden_info > 0 {
                     hidden_parts.push(count(hidden_info, "info message"));
                 }
-                parts.push(format!("{} not shown", hidden_parts.join(" and ")));
+                let reveal_severity = if hidden_info > 0 { "info" } else { "warn" };
+                let pronoun = if hidden_warnings + hidden_info == 1 {
+                    "it"
+                } else {
+                    "them"
+                };
+                parts.push(format!(
+                    "{} not shown, use `--min-severity={reveal_severity}` to see {pronoun}",
+                    hidden_parts.join(" and ")
+                ));
             }
             if parts.len() == 1 {
                 info!("{}", parts[0]);
@@ -2251,6 +2317,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use pyrefly_config::config::ConfigScope;
     use pyrefly_python::module::Module;
     use pyrefly_python::module_name::ModuleName;
     use pyrefly_python::module_path::ModulePath;
@@ -2352,6 +2419,76 @@ mod tests {
         )
     }
 
+    #[test]
+    fn uv_workspace_editable_source_is_excluded_from_project_check() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let source_root = root.join("packages/my-lib/src");
+        let source = source_root.join("my_lib/main.py");
+        let site_packages = root.join("interpreter/lib/python3.13/site-packages");
+        let dependency = site_packages.join("dependency.py");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(&site_packages).unwrap();
+        fs::write(root.join("main.py"), "root_int: int = 1\n").unwrap();
+        fs::write(&source, "my_int: int = \"not int\"\n").unwrap();
+        fs::write(&dependency, "dependency_int: int = \"not int\"\n").unwrap();
+
+        let config_path = root.join("pyproject.toml");
+        fs::write(
+            &config_path,
+            "[tool.pyrefly]\n\n[tool.uv.workspace]\nmembers = [\"packages/*\"]\n",
+        )
+        .unwrap();
+        let (mut config, parse_errors) = ConfigFile::from_file(&config_path);
+        assert!(
+            parse_errors.is_empty(),
+            "{}",
+            parse_errors
+                .iter()
+                .map(ConfigError::get_message)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        config.interpreters.skip_interpreter_query = true;
+        config.python_environment.interpreter_site_package_path =
+            vec![source_root.clone(), site_packages];
+        config.python_environment.interpreter_editable_path = vec![source_root];
+        let configure_errors = config.configure();
+        assert!(
+            configure_errors.is_empty(),
+            "{}",
+            configure_errors
+                .iter()
+                .map(ConfigError::get_message)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let files = config.get_filtered_globs(None, ConfigScope::Default);
+        let config_finder = ConfigFinder::new_constant(ArcId::new(config));
+
+        let (_, errors, check_result) = CheckArgs::parse_from(["check", "--summary=none"])
+            .run_once(
+                "test",
+                Box::new(files),
+                config_finder,
+                UpsellDecision::Skip,
+                ThreadCount::Inline,
+            )
+            .unwrap();
+        let bad_assignments = errors
+            .iter()
+            .filter(|error| error.error_kind() == ErrorKind::BadAssignment)
+            .map(|error| error.path().as_path().to_path_buf())
+            .collect::<Vec<_>>();
+
+        assert_eq!(check_result.checked_file_count, 2);
+        assert_eq!(
+            bad_assignments,
+            vec![source],
+            "the editable workspace source is now checked: {errors:#?}",
+        );
+    }
+
     /// Asking for two reports in one run must produce both of them in full.
     /// See https://github.com/facebook/pyrefly/issues/4683: the CinderX report
     /// dropped the ASTs that the Glean report reads once the check is done, so
@@ -2439,6 +2576,125 @@ def go(w: Widget) -> int:
         )
         .diagnostics;
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn incremental_checker_resolves_unknown_events() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let initial = root.join("initial.py");
+        fs::write(&initial, "x: int = 1\n").unwrap();
+        let mut checker = incremental_checker(&root, vec![initial.clone()]);
+
+        fs::write(&initial, "x: int = 'bad'\n").unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![initial.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert_eq!(errors.len(), 1, "the existing file should be rechecked");
+
+        let created = root.join("created.py");
+        fs::write(&created, "y: int = 'bad'\n").unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![created.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert_eq!(errors.len(), 2, "the new file should be added");
+        assert!(
+            checker.all_files_are_configured(std::slice::from_ref(&created)),
+            "the new file should be configured"
+        );
+
+        fs::remove_file(&initial).unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![initial.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert_eq!(errors.len(), 1, "the missing file should be removed");
+        assert!(
+            !checker.all_files_are_configured(std::slice::from_ref(&initial)),
+            "the missing file should not remain configured"
+        );
+
+        let renamed = root.join("renamed.py");
+        fs::rename(&created, &renamed).unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![created.clone(), renamed.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert_eq!(errors.len(), 1, "the renamed file should be checked");
+        assert_eq!(errors[0].path().as_path(), renamed);
+        assert!(
+            !checker.all_files_are_configured(std::slice::from_ref(&created)),
+            "the old rename path should not remain configured"
+        );
+        assert!(
+            checker.all_files_are_configured(std::slice::from_ref(&renamed)),
+            "the new rename path should be configured"
+        );
+
+        let transient = root.join("transient.py");
+        fs::write(&transient, "z: int = 'bad'\n").unwrap();
+        fs::remove_file(&transient).unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![transient.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert_eq!(
+            errors.len(),
+            1,
+            "a file created and removed before the check should remain absent"
+        );
+        assert!(
+            !checker.all_files_are_configured(std::slice::from_ref(&transient)),
+            "the transient file should not be configured"
+        );
+    }
+
+    #[test]
+    fn incremental_checker_does_not_configure_unknown_files_outside_includes() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let outside = temp.path().join("outside.py");
+        fs::write(&outside, "x: int = 'bad'\n").unwrap();
+        let mut checker = incremental_checker(&root, Vec::new());
+
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![outside.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+
+        assert!(errors.is_empty(), "the excluded file should not be checked");
+        assert!(
+            !checker.all_files_are_configured(std::slice::from_ref(&outside)),
+            "the excluded file should not be configured"
+        );
     }
 
     #[test]
@@ -2862,8 +3118,30 @@ def go(w: Widget) -> int:
 
         assert_eq!(defaults.baseline, None);
         assert_eq!(defaults.baseline_error_level, Severity::Ignore);
+        assert_eq!(
+            defaults.baseline_matching_mode,
+            BaselineMatchingMode::Column
+        );
+        assert_eq!(defaults.baseline_format, BaselineFormat::Full);
         assert_eq!(defaults.output_format, OutputFormat::default());
         assert_eq!(defaults.min_severity, Severity::Error);
+    }
+
+    #[test]
+    fn output_args_inherit_baseline_matching_and_format() {
+        let output = OutputArgs::parse_from(["pyrefly-check"]);
+        let config = ConfigFile {
+            baseline_matching_mode: BaselineMatchingMode::ConciseDescription,
+            baseline_format: BaselineFormat::Minimal,
+            ..Default::default()
+        };
+        let defaults = output.resolve(Some(&config));
+
+        assert_eq!(
+            defaults.baseline_matching_mode,
+            BaselineMatchingMode::ConciseDescription
+        );
+        assert_eq!(defaults.baseline_format, BaselineFormat::Minimal);
     }
 
     #[test]
@@ -3043,6 +3321,32 @@ def go(w: Widget) -> int:
         assert!(!s.contains("your `pyrightconfig.json`"), "{s}");
         assert!(s.contains("preset: default"), "{s}");
         assert!(s.contains("`pyrefly init`"), "{s}");
+    }
+
+    /// The basedpyright variant reports the preset the migration actually
+    /// produced, so a `[tool.basedpyright]` with no explicit
+    /// `typeCheckingMode` surfaces as `all`, not a hardcoded `default`.
+    #[test]
+    fn upsell_for_migrated_from_basedpyright_pyproject() {
+        let s = upsell_string(SynthesizedPresetReason::Migrated(
+            MigratedFromKind::BasedPyright(MigratedConfigSource::PyprojectToml, Preset::All),
+        ));
+        assert!(
+            s.contains("`[tool.basedpyright]` in your `pyproject.toml`"),
+            "{s}"
+        );
+        assert!(s.contains("preset: all"), "{s}");
+        assert!(s.contains("`pyrefly init`"), "{s}");
+    }
+
+    /// An explicit `typeCheckingMode` pins no preset, which the migration
+    /// records as `Default` — the same wording the plain pyright path uses.
+    #[test]
+    fn upsell_for_migrated_from_basedpyright_with_explicit_mode() {
+        let s = upsell_string(SynthesizedPresetReason::Migrated(
+            MigratedFromKind::BasedPyright(MigratedConfigSource::PyprojectToml, Preset::Default),
+        ));
+        assert!(s.contains("preset: default"), "{s}");
     }
 
     /// `UserOverride` is suppressed: the user explicitly chose a

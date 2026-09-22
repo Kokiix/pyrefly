@@ -125,9 +125,9 @@ assert_words!(KeyDecoratedFunction, 1);
 assert_words!(KeyUndecoratedFunction, 1);
 
 assert_words!(Binding, 4);
-assert_words!(BindingExpect, 13);
+assert_words!(BindingExpect, 12);
 assert_words!(BindingTypeAlias, 6);
-assert_words!(BindingAnnotation, 12);
+assert_words!(BindingAnnotation, 11);
 assert_words!(BindingClass, 10);
 assert_words!(BindingTParams, 9);
 assert_words!(BindingClassBaseType, 3);
@@ -143,7 +143,7 @@ assert_words!(BindingClassSynthesizedFields, 2);
 assert_bytes!(BindingLegacyTypeParam, 16);
 assert_words!(BindingYield, 4);
 assert_words!(BindingYieldFrom, 4);
-assert_words!(BindingDecorator, 10);
+assert_words!(BindingDecorator, 9);
 assert_bytes!(BindingDecoratedFunction, 20);
 assert_words!(BindingUndecoratedFunction, 18);
 
@@ -1112,6 +1112,8 @@ pub enum KeyExpect {
     ImplicitAliasCheck(TextRange),
     /// Validate an implementation's implicit return against its annotation.
     ValidateImplicitReturn(TextRange),
+    /// Reachability of the code following a `with` whose body ended in a jump.
+    WithFallthroughReachability(TextRange),
 }
 
 impl Ranged for KeyExpect {
@@ -1129,7 +1131,8 @@ impl Ranged for KeyExpect {
             | KeyExpect::UninitializedCheck(range)
             | KeyExpect::ForwardRefUnion(range)
             | KeyExpect::ImplicitAliasCheck(range)
-            | KeyExpect::ValidateImplicitReturn(range) => *range,
+            | KeyExpect::ValidateImplicitReturn(range)
+            | KeyExpect::WithFallthroughReachability(range) => *range,
         }
     }
 }
@@ -1150,6 +1153,7 @@ impl DisplayWith<ModuleInfo> for KeyExpect {
             KeyExpect::ForwardRefUnion(r) => ("ForwardRefUnion", r),
             KeyExpect::ImplicitAliasCheck(r) => ("ImplicitAliasCheck", r),
             KeyExpect::ValidateImplicitReturn(r) => ("ValidateImplicitReturn", r),
+            KeyExpect::WithFallthroughReachability(r) => ("WithFallthroughReachability", r),
         };
         write!(f, "KeyExpect::{}({})", name, ctx.display(range))
     }
@@ -1230,6 +1234,18 @@ pub enum BindingExpect {
         narrowing_subject: Option<NarrowingSubject>,
         narrow_ops_for_case: (Box<NarrowOp>, TextRange),
         case_range: TextRange,
+    },
+    /// Code following a `with` whose body definitely ended in a jump, which therefore only runs
+    /// if one of the context managers suppresses an exception raised before the jump. Whether any
+    /// of them does is a solve-time question, so binding leaves the flow reachable and defers the
+    /// reachability diagnostic to here.
+    WithFallthroughReachability {
+        /// The context expressions of the `with` items. The code is dead only if every one of
+        /// them is known not to suppress.
+        contexts: Box<[Idx<Key>]>,
+        kind: IsAsync,
+        /// The code that follows the `with` in its suite.
+        range: TextRange,
     },
     /// Track private attribute accesses that need semantic validation.
     PrivateAttributeAccess(PrivateAttributeAccessCheck),
@@ -1363,6 +1379,16 @@ impl DisplayWith<Bindings> for BindingExpect {
                     "MatchCaseReachability({}, {})",
                     ctx.display(*subject_idx),
                     ctx.module().display(case_range)
+                )
+            }
+            Self::WithFallthroughReachability {
+                contexts, range, ..
+            } => {
+                write!(
+                    f,
+                    "WithFallthroughReachability({}, {})",
+                    contexts.len(),
+                    ctx.module().display(range)
                 )
             }
             Self::UninitializedCheck {
@@ -2269,7 +2295,7 @@ pub struct ExhaustiveBinding {
 }
 
 /// Data for the reachability of the code following a `with` statement whose body
-/// terminated with a `raise`
+/// raised, or may have raised before executing a terminating jump.
 #[derive(Clone, Debug)]
 pub struct SuppressedException {
     /// The context expressions of the `with` items, outermost first. Any one of them
@@ -2954,14 +2980,14 @@ impl Binding {
             Binding::MultiTargetAssign(_, _, _, Some(_)) => Some(SymbolKind::Class),
             Binding::UnpackedValue(value) if value.receiver.is_some() => Some(SymbolKind::Class),
             Binding::UnpackedValue(_) => Some(SymbolKind::Variable),
-            Binding::AugAssign(_, _) => Some(SymbolKind::Variable),
-            Binding::Expr(_, _)
-            | Binding::StmtExpr(_, _)
+            Binding::AugAssign(_, _)
+            | Binding::Expr(_, _)
             | Binding::MultiTargetAssign(_, _, _, None)
+            | Binding::AnnotatedType(_, _) => Some(SymbolKind::Variable),
+            Binding::StmtExpr(_, _)
             | Binding::ReturnExplicit(_)
             | Binding::ReturnImplicit(_)
             | Binding::ReturnType(_)
-            | Binding::AnnotatedType(_, _)
             | Binding::None
             | Binding::Any(_)
             | Binding::Forward(_)
@@ -3406,6 +3432,7 @@ impl DisplayWith<Bindings> for BindingClassChecks {
 pub struct ShapedArrayMetadata {
     pub shape_name: Name,
     pub range: TextRange,
+    pub builtin_indexing: bool,
 }
 
 /// Binding for the class's metadata (anything obtained directly from base classes,

@@ -131,8 +131,7 @@ pub fn unions_with_literals(
 }
 
 pub fn intersect(ts: Vec<Type>, fallback: Type, heap: &TypeHeap) -> Type {
-    let is_object = |t: &Type| matches!(t, Type::ClassType(cls) if cls.is_builtin("object"));
-    let has_non_object = ts.iter().any(|t| !is_object(t));
+    let has_non_object = ts.iter().any(|t| !t.is_object());
     let mut flattened = Vec::new();
     for t in ts {
         match t {
@@ -143,7 +142,7 @@ pub fn intersect(ts: Vec<Type>, fallback: Type, heap: &TypeHeap) -> Type {
             Type::Intersect(x) => flattened.extend(x.0),
             t => {
                 // `object & T` is just `T`
-                if !has_non_object || !is_object(&t) {
+                if !has_non_object || !t.is_object() {
                     flattened.push(t);
                 }
             }
@@ -458,19 +457,19 @@ fn collapse_quantifieds(types: &mut Vec<Type>, stdlib: Option<&Stdlib>, heap: &T
     let mut indices_to_remove = SmallSet::new();
     let mut quantifieds_to_collapse = Vec::new();
     for (q, ts) in quantified_intersects {
-        let flag_types;
+        let extension_types;
         let restrictions = match q.restriction() {
             Restriction::Constraints(cs) => cs.iter().collect(),
             Restriction::Bound(Type::Union(u)) => u.members.iter().collect(),
             Restriction::Bound(b) => vec![b],
-            Restriction::Flag(domain) => {
+            Restriction::ShapeExtension(extension) => {
                 let Some(stdlib) = stdlib else {
                     // Raw union construction cannot materialize the builtin domain, so preserve
                     // the unsimplified intersection until a Stdlib-aware normalization boundary.
                     continue;
                 };
-                flag_types = domain.types(stdlib);
-                flag_types.iter().collect()
+                extension_types = extension.upper_bound_members(stdlib);
+                extension_types.iter().collect()
             }
             Restriction::Unrestricted => continue,
         };

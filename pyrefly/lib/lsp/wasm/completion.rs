@@ -40,6 +40,7 @@ use ruff_text_size::TextSize;
 use starlark_map::small_set::SmallSet;
 
 use crate::alt::attr::AttrInfo;
+use crate::alt::polars_specials::is_polars_col;
 use crate::binding::binding::Binding;
 use crate::binding::binding::Key;
 use crate::export::exports::Export;
@@ -550,9 +551,10 @@ impl Transaction<'_> {
         completions: &mut Vec<RankedCompletion>,
     ) -> bool {
         let mut has_added_any = false;
-        if let Some(bindings) = self.get_bindings(handle)
+        if let Some(answers) = self.get_answers(handle)
             && let Some(module_info) = self.get_module_info(handle)
         {
+            let bindings = answers.bindings();
             let matcher = SkimMatcherV2::default();
             for idx in bindings.available_definitions(position) {
                 let key = bindings.idx_to_key(idx);
@@ -570,7 +572,7 @@ impl Transaction<'_> {
                 {
                     continue;
                 }
-                let ty = self.get_type(handle, key);
+                let ty = answers.get_type_at(idx);
                 let export_info = self.key_to_export(handle, key, FindPreference::default());
 
                 let kind = if let Some((_, ref export)) = export_info {
@@ -1157,6 +1159,29 @@ impl Transaction<'_> {
                 if let Some(answers) = self.get_answers(handle)
                     && let Some(base_type) = answers.get_type_trace(base_range)
                 {
+                    // Polars resolves `col.name` against the enclosing DataFrame operation.
+                    if let Type::ClassType(cls) = &base_type
+                        && is_polars_col(cls.class_object())
+                        && let Some(nodes) = covering_nodes.as_deref()
+                        && let Some(source) = self.dataframe_call_source(
+                            handle,
+                            nodes,
+                            TextRange::empty(position),
+                            true,
+                        )
+                        && let Some(ty) = self.get_type_trace(handle, source.range())
+                        && let Some(columns) = Self::collect_dataframe_columns(&ty)
+                    {
+                        for label in columns {
+                            if is_valid_identifier(&label) {
+                                result.push(RankedCompletion::new(CompletionItem {
+                                    label,
+                                    kind: Some(CompletionItemKind::FIELD),
+                                    ..Default::default()
+                                }));
+                            }
+                        }
+                    }
                     self.add_attribute_completions_for_type(
                         handle,
                         base_type,

@@ -86,6 +86,7 @@ fn resolve_third_party_stub(
     bundled_stub: Option<FindingOrError<ModulePath>>,
     from_real_config_file: bool,
     dir_cache: &DirEntryCache,
+    replace_untyped: bool,
 ) -> Option<FindingOrError<ModulePath>> {
     // This is the case where we do have a config file, the package is installed, but there are no stubs
     // available besides the bundled stubs. In this case
@@ -96,15 +97,12 @@ fn resolve_third_party_stub(
         && !package_has_py_typed(module, normal_result, dir_cache)
         && stub_result.is_none()
     {
-        if let Some(pip_package) = recommended_stubs_package(module) {
-            return Some(bundled.clone().with_error(FindError::UntypedImport(
-                module,
-                pip_package.to_string().into(),
-            )));
+        let hint = recommended_stubs_package(module)
+            .map(|package| FindError::UntypedImport(module, package.to_string().into()));
+        if replace_untyped {
+            return Some(FindingOrError::from_error_opt(hint));
         } else {
-            // If we do not have a stub package that we recommend, just return the bundled stub without
-            // the error
-            return Some(bundled.clone());
+            return Some(bundled.clone().with_error_opt(hint));
         }
     }
 
@@ -115,18 +113,27 @@ fn resolve_third_party_stub(
     if let Some(bundled) = bundled_stub
         && stub_result.is_none()
     {
-        if normal_result.is_none() {
+        if let Some(normal_result) = normal_result {
+            // We have both typeshed third party stubs and the actual package.
+            if replace_untyped && !package_has_py_typed(module, normal_result, dir_cache) {
+                return Some(FindingOrError::Error(FindError::Ignored));
+            } else {
+                return Some(bundled);
+            }
+        } else {
             // If we have a real config file, don't return stubs when package is missing.
             // Return None to continue search, which will eventually hit NotFound error.
             if from_real_config_file {
                 return None;
             } else {
                 // Keep existing behavior for non-real config files
-                return Some(bundled.with_error(FindError::MissingSourceForStubs(module)));
+                let error = FindError::MissingSourceForStubs(module);
+                if replace_untyped {
+                    return Some(FindingOrError::Error(error));
+                } else {
+                    return Some(bundled.with_error(error));
+                }
             }
-        } else {
-            // We have both typeshed third party stubs and the actual package
-            return Some(bundled);
         }
     }
 
@@ -143,6 +150,7 @@ fn combine_normal_and_stub_results(
     normal_result: Option<FindResult>,
     namespaces_found: &mut Vec<PathBuf>,
     dir_cache: &DirEntryCache,
+    replace_untyped: bool,
 ) -> Option<FindingOrError<ModulePath>> {
     match (normal_result, stub_result) {
         // A partial stub that resolved only to a bare namespace does not itself
@@ -171,21 +179,40 @@ fn combine_normal_and_stub_results(
             None
         }
         (Some(normal_result), None) => {
-            if let Some(missing_stub_result) = recommended_stubs_package(module)
-                && !package_has_py_typed(module, &normal_result, dir_cache)
-            {
-                Some(
-                    find_result_module_path(normal_result).with_error(FindError::UntypedImport(
-                        module,
-                        missing_stub_result.as_str().to_owned().into(),
-                    )),
-                )
+            let recommended_stubs = recommended_stubs_package(module);
+            if replace_untyped || recommended_stubs.is_some() {
+                // We look up `py.typed` only after we've checked that we actually need it because
+                // this does a filesystem walk.
+                let untyped = !package_has_py_typed(module, &normal_result, dir_cache);
+                let hint = if untyped {
+                    recommended_stubs
+                        .map(|package| FindError::UntypedImport(module, package.to_string().into()))
+                } else {
+                    None
+                };
+                if untyped && replace_untyped {
+                    Some(FindingOrError::from_error_opt(hint))
+                } else {
+                    Some(find_result_module_path(normal_result).with_error_opt(hint))
+                }
             } else {
                 Some(find_result_module_path(normal_result))
             }
         }
         (None, _) => None,
     }
+}
+
+/// How to treat installed distributions. Only meaningful when searching site
+/// package roots.
+#[derive(Default)]
+struct SitePackagePolicy {
+    /// The stub Pyrefly bundles for this module, if it ships one.
+    typeshed_third_party_stub: Option<FindingOrError<ModulePath>>,
+    /// Whether the user wrote a config file.
+    from_real_config_file: bool,
+    /// Whether to replace an untyped package with `typing.Any`.
+    replace_untyped: bool,
 }
 
 /// Search for the given [`ModuleName`] in the given `include`, which is
@@ -210,8 +237,7 @@ fn find_module<'a, I>(
     include: I,
     namespaces_found: &mut Vec<PathBuf>,
     style_filter: Option<ModuleStyle>,
-    typeshed_third_party_stub: Option<FindingOrError<ModulePath>>,
-    from_real_config_file: bool,
+    site_package_policy: SitePackagePolicy,
     phantom_paths: &mut Option<&mut Vec<PathBuf>>,
     dir_cache: &DirEntryCache,
     timing: Option<&TransactionTimingCounters>,
@@ -231,9 +257,10 @@ where
         module,
         results.stub_result.as_ref(),
         results.normal_result.as_ref(),
-        typeshed_third_party_stub,
-        from_real_config_file,
+        site_package_policy.typeshed_third_party_stub,
+        site_package_policy.from_real_config_file,
         dir_cache,
+        site_package_policy.replace_untyped,
     ) {
         return Some(result);
     }
@@ -243,6 +270,7 @@ where
         results.normal_result,
         namespaces_found,
         dir_cache,
+        site_package_policy.replace_untyped,
     )
 }
 
@@ -409,9 +437,61 @@ fn find_third_party_stub(
     }
 }
 
+/// Controls whether a lookup follows `replace-imports-with-any`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImportReplacementPolicy {
+    Respect,
+    Bypass,
+}
+
+/// Selects whether import resolution follows type-checking semantics or looks for a
+/// particular module style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImportLookupMode {
+    /// Resolve the import as the type checker would.
+    TypeChecking,
+    /// Resolve the import for a particular module style.
+    Style {
+        style: ModuleStyle,
+        replacement_policy: ImportReplacementPolicy,
+    },
+}
+
+impl ImportLookupMode {
+    pub(crate) fn style(style: ModuleStyle) -> Self {
+        Self::Style {
+            style,
+            replacement_policy: ImportReplacementPolicy::Respect,
+        }
+    }
+
+    pub(crate) fn style_including_replaced(style: ModuleStyle) -> Self {
+        Self::Style {
+            style,
+            replacement_policy: ImportReplacementPolicy::Bypass,
+        }
+    }
+
+    fn style_filter(self) -> Option<ModuleStyle> {
+        match self {
+            Self::TypeChecking => None,
+            Self::Style { style, .. } => Some(style),
+        }
+    }
+
+    fn replacement_policy(self) -> ImportReplacementPolicy {
+        match self {
+            Self::TypeChecking => ImportReplacementPolicy::Respect,
+            Self::Style {
+                replacement_policy, ..
+            } => replacement_policy,
+        }
+    }
+}
+
 // TODO(connernilsen): change things so that we return all entries that match for a given
 // module name across all path components (search path, site package path, ...).
-// Instead, at specific times (`find_module_components`, `find_module`, `find_import_filtered`),
+// Instead, at specific times (`find_module_components`, `find_module`, `find_import_with_mode`),
 // see if we have a result for a highest priority item (something that is a single file module
 // matching our style_filter (if applicable) or regular package, and return that. Otherwise,
 // keep searching, and if we get the end, look through everything we've found and select the
@@ -431,20 +511,24 @@ fn find_third_party_stub(
 ///
 /// If `None` is returned when `style_filter.is_some()`, the import should be retried
 /// with `style_filter.is_none()`, since we hard-filter a lot of values here.
-pub fn find_import_internal(
+fn find_import_internal(
     config: &ConfigFile,
     module: ModuleName,
     origin: Option<&ModulePath>,
-    style_filter: Option<ModuleStyle>,
+    lookup_mode: ImportLookupMode,
     phantom_paths: &mut Option<&mut Vec<PathBuf>>,
     dir_cache: &DirEntryCache,
     timing: Option<&TransactionTimingCounters>,
 ) -> FindingOrError<ModulePath> {
+    let style_filter = lookup_mode.style_filter();
     let mut namespaces_found = vec![];
     let origin = origin.map(|p| p.as_path());
     let from_real_config_file = config.from_real_config_file();
 
-    if module != ModuleName::builtins() && config.replace_imports_with_any(origin, module) {
+    if lookup_mode.replacement_policy() == ImportReplacementPolicy::Respect
+        && module != ModuleName::builtins()
+        && config.replace_imports_with_any(origin, module)
+    {
         FindingOrError::Error(FindError::Ignored)
     } else if let Some(build_system) = config.build_system.as_ref()
         && let Some(path) = find_module(
@@ -452,8 +536,7 @@ pub fn find_import_internal(
             build_system.search_path_prefix.iter(),
             &mut namespaces_found,
             style_filter,
-            None,
-            false,
+            SitePackagePolicy::default(),
             phantom_paths,
             dir_cache,
             timing,
@@ -469,8 +552,7 @@ pub fn find_import_internal(
         config.search_path(),
         &mut namespaces_found,
         style_filter,
-        None,
-        false,
+        SitePackagePolicy::default(),
         phantom_paths,
         dir_cache,
         timing,
@@ -482,8 +564,7 @@ pub fn find_import_internal(
             std::iter::once(&custom_typeshed_stdlib),
             &mut namespaces_found,
             style_filter,
-            None,
-            false,
+            SitePackagePolicy::default(),
             phantom_paths,
             dir_cache,
             timing,
@@ -519,8 +600,7 @@ pub fn find_import_internal(
                 }),
             &mut namespaces_found,
             style_filter,
-            None,
-            false,
+            SitePackagePolicy::default(),
             phantom_paths,
             dir_cache,
             timing,
@@ -532,8 +612,15 @@ pub fn find_import_internal(
         config.site_package_path(),
         &mut namespaces_found,
         style_filter,
-        find_third_party_stub(module, style_filter),
-        from_real_config_file,
+        SitePackagePolicy {
+            typeshed_third_party_stub: find_third_party_stub(module, style_filter),
+            from_real_config_file,
+            // A style-filtered search asks where a module's implementation file
+            // lives, not whether to trust the package's types, so it must keep
+            // resolving to the real source.
+            replace_untyped: style_filter.is_none()
+                && config.replace_untyped_imports_with_any(origin, module),
+        },
         phantom_paths,
         dir_cache,
         timing,
@@ -548,6 +635,16 @@ pub fn find_import_internal(
         )
     {
         path
+    } else if style_filter.is_none()
+        && config.replace_untyped_imports_with_any(origin, module)
+        && !namespaces_found.is_empty()
+        && namespaces_found.iter().all(|namespace| {
+            config
+                .site_package_path()
+                .any(|site_package| namespace.starts_with(site_package))
+        })
+    {
+        FindingOrError::Error(FindError::Ignored)
     } else if let Some(namespace) = namespaces_found.into_iter().next() &&
         // only use namespaces if style filter is none, since otherwise we might be
         // skipping a result that's more preferable, but excluded because of the style
@@ -583,18 +680,18 @@ pub fn find_import(
         config,
         module,
         origin,
-        None,
+        ImportLookupMode::TypeChecking,
         &mut phantom_paths,
         dir_cache,
         timing,
     )
 }
 
-pub fn find_import_filtered(
+pub(crate) fn find_import_with_mode(
     config: &ConfigFile,
     module: ModuleName,
     origin: Option<&ModulePath>,
-    style_filter: Option<ModuleStyle>,
+    lookup_mode: ImportLookupMode,
     dir_cache: &DirEntryCache,
     timing: Option<&TransactionTimingCounters>,
 ) -> FindingOrError<ModulePath> {
@@ -602,7 +699,7 @@ pub fn find_import_filtered(
         config,
         module,
         origin,
-        style_filter,
+        lookup_mode,
         &mut None,
         dir_cache,
         timing,
@@ -685,6 +782,8 @@ fn suggest_stdlib_import_uncached(missing: ModuleName) -> Option<ModuleName> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use pyrefly_config::config::ConfigSource;
     use pyrefly_config::environment::environment::PythonEnvironment;
     use pyrefly_config::environment::interpreters::Interpreters;
@@ -715,8 +814,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -730,8 +828,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -745,8 +842,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -771,8 +867,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 Some(&timing),
@@ -805,8 +900,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -820,8 +914,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -852,8 +945,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -884,8 +976,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -929,8 +1020,7 @@ mod tests {
                     search_roots.iter(),
                     &mut namespaces,
                     None,
-                    None,
-                    false,
+                    SitePackagePolicy::default(),
                     &mut None,
                     &DirEntryCache::new(),
                     None,
@@ -954,8 +1044,7 @@ mod tests {
                 search_roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -977,8 +1066,7 @@ mod tests {
                 [root.join("search_root0")].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1008,8 +1096,7 @@ mod tests {
                 [root.join("search_root0")].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1026,8 +1113,7 @@ mod tests {
                 [root.join("search_root0")].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1070,8 +1156,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1088,8 +1173,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1104,8 +1188,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1143,8 +1226,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1161,8 +1243,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1210,8 +1291,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1228,8 +1308,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1244,8 +1323,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1288,8 +1366,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1307,8 +1384,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1324,8 +1400,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1374,8 +1449,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1392,8 +1466,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1408,8 +1481,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1457,8 +1529,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1476,8 +1547,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1493,8 +1563,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1538,8 +1607,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1556,8 +1624,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1572,8 +1639,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1613,8 +1679,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1630,8 +1695,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1673,8 +1737,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1690,8 +1753,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1735,8 +1797,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1752,8 +1813,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1800,8 +1860,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1819,8 +1878,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1836,8 +1894,7 @@ mod tests {
                 roots.iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1887,11 +1944,11 @@ mod tests {
         };
         config.configure();
         assert_eq!(
-            find_import_filtered(
+            find_import_with_mode(
                 &config,
                 ModuleName::from_str("a.c"),
                 None,
-                None,
+                ImportLookupMode::TypeChecking,
                 &DirEntryCache::new(),
                 None
             ),
@@ -1900,11 +1957,11 @@ mod tests {
             FindingOrError::new_finding(ModulePath::filesystem(root.join("search_root1/a/c.py")))
         );
         assert_eq!(
-            find_import_filtered(
+            find_import_with_mode(
                 &config,
                 ModuleName::from_str("spp_priority"),
                 None,
-                None,
+                ImportLookupMode::TypeChecking,
                 &DirEntryCache::new(),
                 None
             ),
@@ -1918,11 +1975,11 @@ mod tests {
         // we would either take the `__init__.py` result or nothing when a `ModuleStyle` is
         // provided than a namespace package
         assert_eq!(
-            find_import_filtered(
+            find_import_with_mode(
                 &config,
                 ModuleName::from_str("spp_priority.d"),
                 None,
-                None,
+                ImportLookupMode::TypeChecking,
                 &DirEntryCache::new(),
                 None
             ),
@@ -1931,11 +1988,11 @@ mod tests {
             )),
         );
         assert_eq!(
-            find_import_filtered(
+            find_import_with_mode(
                 &config,
                 ModuleName::from_str("spp_priority.d"),
                 None,
-                Some(ModuleStyle::Interface),
+                ImportLookupMode::style(ModuleStyle::Interface),
                 &DirEntryCache::new(),
                 None,
             ),
@@ -1979,8 +2036,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -1994,8 +2050,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2011,8 +2066,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2026,8 +2080,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2057,8 +2110,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2072,8 +2124,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2087,8 +2138,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2127,8 +2177,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2142,8 +2191,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2157,8 +2205,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2172,8 +2219,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2200,8 +2246,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2238,8 +2283,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2271,8 +2315,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2286,8 +2329,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2301,8 +2343,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2341,8 +2382,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2359,8 +2399,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2401,8 +2440,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut namespaces,
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2416,8 +2454,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2433,8 +2470,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2456,8 +2492,7 @@ mod tests {
             [root.to_path_buf()].iter(),
             &mut vec![],
             None,
-            None,
-            false,
+            SitePackagePolicy::default(),
             &mut None,
             &DirEntryCache::new(),
             None,
@@ -2472,8 +2507,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2497,8 +2531,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2528,8 +2561,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 None,
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2544,8 +2576,7 @@ mod tests {
             [root.to_path_buf()].iter(),
             &mut vec![],
             None,
-            None,
-            false,
+            SitePackagePolicy::default(),
             &mut None,
             &DirEntryCache::new(),
             None,
@@ -2581,8 +2612,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 Some(ModuleStyle::Executable),
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2597,8 +2627,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 Some(ModuleStyle::Interface),
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2612,8 +2641,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 Some(ModuleStyle::Executable),
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2628,8 +2656,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 Some(ModuleStyle::Interface),
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2654,8 +2681,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 Some(ModuleStyle::Executable),
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2669,8 +2695,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 Some(ModuleStyle::Interface),
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2698,8 +2723,7 @@ mod tests {
                 [root.to_path_buf()].iter(),
                 &mut vec![],
                 Some(ModuleStyle::Executable),
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2735,8 +2759,7 @@ mod tests {
                 search_roots.iter(),
                 &mut vec![],
                 Some(ModuleStyle::Executable),
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2752,8 +2775,7 @@ mod tests {
                 search_roots.iter(),
                 &mut vec![],
                 Some(ModuleStyle::Interface),
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2770,8 +2792,7 @@ mod tests {
                 search_roots.iter(),
                 &mut vec![],
                 Some(ModuleStyle::Interface),
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2784,8 +2805,7 @@ mod tests {
                 search_roots.iter(),
                 &mut vec![],
                 Some(ModuleStyle::Executable),
-                None,
-                false,
+                SitePackagePolicy::default(),
                 &mut None,
                 &DirEntryCache::new(),
                 None,
@@ -2813,17 +2833,248 @@ mod tests {
         config
     }
 
+    /// A first-party root plus a site package directory holding representative
+    /// package layouts for testing untyped import handling.
+    fn untyped_imports_config(root: &Path, replace_untyped: &[&str]) -> ConfigFile {
+        TestPath::setup_test_directory(
+            root,
+            vec![
+                TestPath::dir(
+                    "src",
+                    vec![TestPath::dir(
+                        "first_party",
+                        vec![TestPath::file("__init__.py")],
+                    )],
+                ),
+                TestPath::dir(
+                    "site_packages",
+                    vec![
+                        TestPath::dir("untyped_package", vec![TestPath::file("__init__.py")]),
+                        TestPath::dir("other_untyped_package", vec![TestPath::file("__init__.py")]),
+                        TestPath::dir(
+                            "typed_package",
+                            vec![TestPath::file("py.typed"), TestPath::file("__init__.py")],
+                        ),
+                        TestPath::dir("stubbed_package", vec![TestPath::file("__init__.pyi")]),
+                        TestPath::dir(
+                            "namespace",
+                            vec![
+                                TestPath::dir(
+                                    "typed_package",
+                                    vec![TestPath::file("py.typed"), TestPath::file("__init__.py")],
+                                ),
+                                TestPath::dir(
+                                    "untyped_package",
+                                    vec![TestPath::file("__init__.py")],
+                                ),
+                            ],
+                        ),
+                        // Typeshed has no stubs for `django`, but Pyrefly still
+                        // recommends the `django-stubs` distribution for it.
+                        TestPath::dir("django", vec![TestPath::file("__init__.py")]),
+                    ],
+                ),
+            ],
+        );
+
+        let mut config = ConfigFile::parse_config(&format!(
+            "replace-untyped-imports-with-any = {replace_untyped:?}"
+        ))
+        .expect("test configuration should parse");
+        config.source = ConfigSource::File(root.join("pyrefly.toml"));
+        config.interpreters.skip_interpreter_query = true;
+        config.search_path_from_file = vec![root.join("src")];
+        config.python_environment.site_package_path = Some(vec![root.join("site_packages")]);
+        config.disable_search_path_heuristics = true;
+        config.configure();
+        config
+    }
+
+    #[test]
+    fn test_replace_untyped_imports_with_any() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        let config = untyped_imports_config(
+            root,
+            &[
+                "untyped_package",
+                "stubbed_package",
+                "namespace.*",
+                "django",
+            ],
+        );
+
+        let find = |module| {
+            find_import_with_mode(
+                &config,
+                ModuleName::from_str(module),
+                None,
+                ImportLookupMode::TypeChecking,
+                &DirEntryCache::new(),
+                None,
+            )
+        };
+        let found = |path: PathBuf| FindingOrError::new_finding(ModulePath::filesystem(path));
+
+        // Site packages in untyped_imports_config without a `py.typed` marker become `Any`.
+        assert_eq!(
+            find("untyped_package"),
+            FindingOrError::Error(FindError::Ignored)
+        );
+        assert_eq!(
+            find("stubbed_package"),
+            FindingOrError::Error(FindError::Ignored)
+        );
+        assert_eq!(find("namespace"), FindingOrError::Error(FindError::Ignored));
+        assert_eq!(
+            find("namespace.untyped_package"),
+            FindingOrError::Error(FindError::Ignored)
+        );
+        // The setting applies only to matching modules.
+        assert_eq!(
+            find("other_untyped_package"),
+            found(root.join("site_packages/other_untyped_package/__init__.py"))
+        );
+        // Same, but Pyrefly knows which distribution supplies the missing stubs,
+        // so it says so rather than dropping the import silently.
+        assert_eq!(
+            find("django"),
+            FindingOrError::Error(FindError::UntypedImport(
+                ModuleName::from_str("django"),
+                "django-stubs".to_owned().into()
+            ))
+        );
+
+        // Everything else that is typed still resolves to its own files.
+        assert_eq!(
+            find("first_party"),
+            found(root.join("src/first_party/__init__.py"))
+        );
+        assert_eq!(
+            find("typed_package"),
+            found(root.join("site_packages/typed_package/__init__.py"))
+        );
+        assert_eq!(
+            find("namespace.typed_package"),
+            found(root.join("site_packages/namespace/typed_package/__init__.py"))
+        );
+    }
+
+    #[test]
+    fn test_untyped_imports_are_followed_by_default() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        let config = untyped_imports_config(root, &[]);
+        assert!(
+            !config.replace_untyped_imports_with_any(None, ModuleName::from_str("untyped_package"))
+        );
+
+        let find = |module| {
+            find_import_with_mode(
+                &config,
+                ModuleName::from_str(module),
+                None,
+                ImportLookupMode::TypeChecking,
+                &DirEntryCache::new(),
+                None,
+            )
+        };
+
+        assert_eq!(
+            find("untyped_package"),
+            FindingOrError::new_finding(ModulePath::filesystem(
+                root.join("site_packages/untyped_package/__init__.py")
+            ))
+        );
+        assert_eq!(
+            find("namespace.untyped_package"),
+            FindingOrError::new_finding(ModulePath::filesystem(
+                root.join("site_packages/namespace/untyped_package/__init__.py")
+            ))
+        );
+        // The recommendation is still attached, but it does not stop resolution.
+        assert_eq!(
+            find("django"),
+            FindingOrError::new_finding(ModulePath::filesystem(
+                root.join("site_packages/django/__init__.py")
+            ))
+            .with_error(FindError::UntypedImport(
+                ModuleName::from_str("django"),
+                "django-stubs".to_owned().into()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_replace_untyped_imports_with_any_keeps_executable_lookup() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        // `requests` is untyped on disk but Pyrefly bundles typeshed stubs for it.
+        // The IDE finds the source behind those stubs with an executable-filtered
+        // search, which must keep reaching the source.
+        TestPath::setup_test_directory(
+            root,
+            vec![TestPath::dir(
+                "site_packages",
+                vec![TestPath::dir(
+                    "requests",
+                    vec![TestPath::file("__init__.py")],
+                )],
+            )],
+        );
+
+        let mut config =
+            ConfigFile::parse_config("replace-untyped-imports-with-any = [\"requests\"]")
+                .expect("test configuration should parse");
+        config.source = ConfigSource::File(root.join("pyrefly.toml"));
+        config.interpreters.skip_interpreter_query = true;
+        config.python_environment.site_package_path = Some(vec![root.join("site_packages")]);
+        config.disable_search_path_heuristics = true;
+        config.configure();
+
+        let unfiltered = find_import_with_mode(
+            &config,
+            ModuleName::from_str("requests"),
+            None,
+            ImportLookupMode::TypeChecking,
+            &DirEntryCache::new(),
+            None,
+        );
+        assert!(
+            matches!(
+                unfiltered,
+                FindingOrError::Error(FindError::UntypedImport(..))
+            ),
+            "Expected `requests` to be untyped"
+        );
+
+        let executable = find_import_with_mode(
+            &config,
+            ModuleName::from_str("requests"),
+            None,
+            ImportLookupMode::style(ModuleStyle::Executable),
+            &DirEntryCache::new(),
+            None,
+        );
+        assert_eq!(
+            executable.finding(),
+            Some(ModulePath::filesystem(
+                root.join("site_packages/requests/__init__.py")
+            ))
+        );
+    }
+
     #[test]
     fn test_find_import_uses_typeshed_third_party_without_config() {
         let mut config = get_config(ConfigSource::Synthetic(None));
         let config_root = std::env::current_dir().unwrap();
         config.rewrite_with_path_to_config(&config_root);
 
-        let result = find_import_filtered(
+        let result = find_import_with_mode(
             &config,
             ModuleName::from_str("requests"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -2842,11 +3093,11 @@ mod tests {
 
         assert!(config.from_real_config_file());
 
-        let result = find_import_filtered(
+        let result = find_import_with_mode(
             &config,
             ModuleName::from_str("requests"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -2867,11 +3118,11 @@ mod tests {
         config.rewrite_with_path_to_config(&config_root);
 
         assert!(!config.from_real_config_file());
-        let result = find_import_filtered(
+        let result = find_import_with_mode(
             &config,
             ModuleName::from_str("requests"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -2910,11 +3161,11 @@ mod tests {
     fn test_real_config_file_with_third_party_stub_returns_not_found() {
         let config = get_config(ConfigSource::File("".into()));
         assert!(config.from_real_config_file());
-        let result = find_import_filtered(
+        let result = find_import_with_mode(
             &config,
             ModuleName::from_str("requests"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -2935,11 +3186,11 @@ mod tests {
     #[test]
     fn test_missing_stubs_error_not_created_without_real_config() {
         let config_synthetic = get_config(ConfigSource::Synthetic(None));
-        let result_synthetic = find_import_filtered(
+        let result_synthetic = find_import_with_mode(
             &config_synthetic,
             ModuleName::from_str("requests"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -2950,11 +3201,11 @@ mod tests {
         );
 
         let config_marker = get_config(ConfigSource::Marker("".into()));
-        let result_marker = find_import_filtered(
+        let result_marker = find_import_with_mode(
             &config_marker,
             ModuleName::from_str("requests"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -2986,11 +3237,11 @@ mod tests {
         config.python_environment.site_package_path = Some(vec![root.join("site_packages")]);
         config.configure();
 
-        let result = find_import_filtered(
+        let result = find_import_with_mode(
             &config,
             ModuleName::from_str("requests"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -3034,11 +3285,11 @@ mod tests {
         config.python_environment.site_package_path = Some(vec![root.join("site_packages")]);
         config.configure();
 
-        let result = find_import_filtered(
+        let result = find_import_with_mode(
             &config,
             ModuleName::from_str("requests"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -3079,11 +3330,11 @@ mod tests {
         config.python_environment.site_package_path = Some(vec![root.join("site_packages")]);
         config.configure();
 
-        let result = find_import_filtered(
+        let result = find_import_with_mode(
             &config,
             ModuleName::from_str("requests.api"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -3124,11 +3375,11 @@ mod tests {
         config.python_environment.site_package_path = Some(vec![root.join("site_packages")]);
         config.configure();
 
-        let result = find_import_filtered(
+        let result = find_import_with_mode(
             &config,
             ModuleName::from_str("requests.api"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -3165,11 +3416,11 @@ mod tests {
         config.python_environment.site_package_path = Some(vec![root.join("site_packages")]);
         config.configure();
 
-        let result = find_import_filtered(
+        let result = find_import_with_mode(
             &config,
             ModuleName::from_str("dateutil"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -3205,11 +3456,11 @@ mod tests {
         config.configure();
 
         // 'requests' exists in typeshed third party stubs but not in our site_packages
-        let result = find_import_filtered(
+        let result = find_import_with_mode(
             &config,
             ModuleName::from_str("requests"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -3242,11 +3493,11 @@ mod tests {
         config.configure();
 
         // 'requests' exists in both typeshed third party stubs AND site_packages
-        let result = find_import_filtered(
+        let result = find_import_with_mode(
             &config,
             ModuleName::from_str("requests"),
             None,
-            None,
+            ImportLookupMode::TypeChecking,
             &DirEntryCache::new(),
             None,
         );
@@ -4179,6 +4430,45 @@ mod tests {
             )
             .unwrap(),
             FindingOrError::new_finding(ModulePath::filesystem(root.join("rules/if.config.cconf")))
+        );
+    }
+
+    #[test]
+    fn test_style_lookup_can_include_replaced_import() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        TestPath::setup_test_directory(root, vec![TestPath::file("replaced.py")]);
+
+        let mut config = ConfigFile::parse_config("replace-imports-with-any = [\"replaced\"]")
+            .expect("test configuration should parse");
+        config.source = ConfigSource::File(root.join("pyrefly.toml"));
+        config.interpreters.skip_interpreter_query = true;
+        config.search_path_from_file = vec![root.to_path_buf()];
+        config.configure();
+
+        let module = ModuleName::from_str("replaced");
+        let cache = DirEntryCache::new();
+        assert_eq!(
+            find_import_with_mode(
+                &config,
+                module,
+                None,
+                ImportLookupMode::style(ModuleStyle::Executable),
+                &cache,
+                None,
+            ),
+            FindingOrError::Error(FindError::Ignored)
+        );
+        assert_eq!(
+            find_import_with_mode(
+                &config,
+                module,
+                None,
+                ImportLookupMode::style_including_replaced(ModuleStyle::Executable),
+                &cache,
+                None,
+            ),
+            FindingOrError::new_finding(ModulePath::filesystem(root.join("replaced.py")))
         );
     }
 }

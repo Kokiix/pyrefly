@@ -303,20 +303,19 @@ class WaveRNN[
         # from it inherits that.
         x = torch.cat((waveform_2d.unsqueeze(-1), specgram_up_t, a1), dim=-1)
         assert_type(x, Tensor)
-        # Each Linear still pins its own output feature count, so the trailing
-        # axis stays exact for the rest of the method even though the leading
-        # batch and time axes never recover.
+        # Each Linear and GRU still pins its own output feature count, so the
+        # trailing axis stays exact even though the leading rank never recovers.
         x = self.fc(x)
         assert_type(x, Tensor[[*Elements[IntTuple], NR]])
         res = x
         x, _ = self.rnn1(x, h1)
-        assert_type(x, Tensor[[int, int, NR]])
+        assert_type(x, Tensor[[*Elements[IntTuple], NR]])
 
         x = x + res
         res = x
         x = torch.cat((x, a2), dim=-1)
         x, _ = self.rnn2(x, h2)
-        assert_type(x, Tensor[[int, int, NR]])
+        assert_type(x, Tensor)
 
         x = x + res
         x = torch.cat((x, a3), dim=-1)
@@ -340,7 +339,7 @@ class WaveRNN[
         device = specgram.device
         dtype = specgram.dtype
 
-        specgram_padded: Tensor[[B, NF, Any]] = F.pad(  # type: ignore[assignment]
+        specgram_padded: Tensor[[B, NF, Any]] = F.pad(  # type: ignore[pyrefly:bad-assignment]
             specgram, (self._pad, self._pad)
         )
         assert_type(specgram_padded, Tensor[[B, NF, Any]])
@@ -407,7 +406,7 @@ class WaveRNN[
 
             x = torch.multinomial(posterior, 1).float()
             assert_type(x, Tensor[[B, 1]])
-            # A nonliteral `int` exponent makes `int.__pow__` return `Any`.
+            # The scalar divisor is a `float`, so tensor arithmetic preserves the shape.
             x = 2 * x / (2 ** (self.n_bits * 1.0) - 1.0) - 1.0
             assert_type(x, Tensor[[B, 1]])
 

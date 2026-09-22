@@ -34,6 +34,7 @@ use pyrefly_util::display::DisplayWith;
 use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::lock::Mutex;
 use pyrefly_util::uniques::UniqueFactory;
+use pyrefly_util::visit::VisitMut;
 use ruff_python_ast::name::Name;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
@@ -121,6 +122,43 @@ pub enum AttributeReferenceKind {
     ConstructorCall,
 }
 
+/// Visiting a trace store reaches every type recorded in it.
+impl VisitMut<Type> for Traces {
+    fn recurse_mut(&mut self, f: &mut dyn FnMut(&mut Type)) {
+        for map in [
+            &mut self.types,
+            &mut self.invoked_properties,
+            &mut self.expected_types,
+        ] {
+            for ty in map.values_mut() {
+                f(Arc::make_mut(ty));
+            }
+        }
+        for callee in self.overloaded_callees.values_mut() {
+            // Note: `tparams` does not need to be visited, as this comes from an answer
+            // which is already visited. `TArgs` skips tparams for the same reason.
+            match callee {
+                OverloadedCallee::Resolved { callable: trace } => {
+                    let OverloadTrace {
+                        callable,
+                        tparams: _,
+                    } = trace;
+                    callable.visit_mut(f);
+                }
+                OverloadedCallee::Candidates { all, closest, .. } => {
+                    for OverloadTrace {
+                        callable,
+                        tparams: _,
+                    } in all.iter_mut().chain(std::iter::once(closest))
+                    {
+                        callable.visit_mut(f);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OverloadTrace {
     callable: Callable,
@@ -198,11 +236,12 @@ pub struct TraceSideEffects {
 ///
 /// * Every module name referenced anywhere MUST be present
 ///   in the `exports` and `bindings` map.
-/// * Every key referenced in `bindings`/`answers` MUST be present.
+/// * Every referenced key MUST have entries in the binding and answer tables.
 ///
 /// We never issue contains queries on these maps.
 #[derive(Debug)]
 pub struct Answers {
+    bindings: Bindings,
     solver: Solver,
     table: AnswerTable,
     solutions: Arc<SolutionsData>,
@@ -627,10 +666,10 @@ impl<K: Keyed> Default for AnswerEntry<K> {
 }
 
 /// `Answers::new` gives every binding a slot, so a lookup only fails when `idx`
-/// came from different `Bindings` than the answers being indexed.
+/// came from a different `Answers` instance.
 fn missing_answer_slot<K: Keyed>(idx: Idx<K>) -> ! {
     panic!(
-        "no answer slot for {} at index {}; the index must come from the bindings these answers were built from",
+        "no answer slot for {} at index {}; the index must come from these answers' bindings",
         type_name::<K>(),
         idx.idx(),
     )
@@ -643,41 +682,6 @@ impl<K: Keyed> AnswerEntry<K> {
             .get(idx.idx())
             .unwrap_or_else(|| missing_answer_slot(idx))
     }
-
-    fn get(&self, idx: Idx<K>) -> Option<&K::Answer> {
-        self.answer_slot(idx).get()
-    }
-
-    fn record(&self, idx: Idx<K>, answer: AnswerBox<K::Answer>) -> (&K::Answer, bool) {
-        self.answer_slot(idx).record(answer)
-    }
-
-    fn record_alias(&self, idx: Idx<K>, target: Idx<K>) -> (&K::Answer, bool) {
-        let slot = self.answer_slot(idx);
-        let target = self.answer_slot(target);
-        // SAFETY: Both slots belong to this entry and are dropped together.
-        unsafe { slot.record_alias(target) }
-    }
-
-    fn reserve(&self, idx: Idx<K>, answer: AnswerBox<K::Answer>) -> bool {
-        self.answer_slot(idx).reserve(answer)
-    }
-
-    /// # Safety
-    ///
-    /// The caller must own the reservation for `idx`'s slot.
-    unsafe fn publish_reserved(&self, idx: Idx<K>) {
-        // SAFETY: Forwarded from the caller.
-        unsafe { self.answer_slot(idx).publish_reserved() }
-    }
-
-    /// # Safety
-    ///
-    /// The caller must own the reservation for `idx`'s slot.
-    unsafe fn rollback_reserved_if_pending(&self, idx: Idx<K>) -> bool {
-        // SAFETY: Forwarded from the caller.
-        unsafe { self.answer_slot(idx).rollback_reserved_if_pending() }
-    }
 }
 
 table!(
@@ -685,11 +689,10 @@ table!(
     pub struct AnswerTable(pub AnswerEntry)
 );
 
-impl DisplayWith<Bindings> for Answers {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, bindings: &Bindings) -> fmt::Result {
+impl fmt::Display for Answers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fn go<K: Keyed>(
             answers: &Answers,
-            bindings: &Bindings,
             _entry: &AnswerEntry<K>,
             f: &mut fmt::Formatter<'_>,
         ) -> fmt::Result
@@ -698,6 +701,7 @@ impl DisplayWith<Bindings> for Answers {
             BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
             SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
         {
+            let bindings = answers.bindings();
             for idx in bindings.keys::<K>() {
                 let key = bindings.idx_to_key(idx);
                 let value = bindings.get(idx);
@@ -715,7 +719,7 @@ impl DisplayWith<Bindings> for Answers {
             Ok(())
         }
 
-        table_try_for_each!(self.table, |x| go(self, bindings, x, f));
+        table_try_for_each!(self.table, |x| go(self, x, f));
         Ok(())
     }
 }
@@ -743,41 +747,6 @@ impl<K: Keyed> SolutionsEntry<K> {
             Some((_, slot)) => slot,
             None => missing_answer_slot(idx),
         }
-    }
-
-    fn get(&self, idx: Idx<K>) -> Option<&K::Answer> {
-        self.answer_slot(idx).get()
-    }
-
-    fn record(&self, idx: Idx<K>, answer: AnswerBox<K::Answer>) -> (&K::Answer, bool) {
-        self.answer_slot(idx).record(answer)
-    }
-
-    fn record_alias(&self, idx: Idx<K>, target: Idx<K>) -> (&K::Answer, bool) {
-        let slot = self.answer_slot(idx);
-        let target = self.answer_slot(target);
-        // SAFETY: Both slots belong to this entry and are dropped together.
-        unsafe { slot.record_alias(target) }
-    }
-
-    fn reserve(&self, idx: Idx<K>, answer: AnswerBox<K::Answer>) -> bool {
-        self.answer_slot(idx).reserve(answer)
-    }
-
-    /// # Safety
-    ///
-    /// The caller must own the reservation for `idx`'s slot.
-    unsafe fn publish_reserved(&self, idx: Idx<K>) {
-        // SAFETY: Forwarded from the caller.
-        unsafe { self.answer_slot(idx).publish_reserved() }
-    }
-
-    /// # Safety
-    ///
-    /// The caller must own the reservation for `idx`'s slot.
-    unsafe fn rollback_reserved_if_pending(&self, idx: Idx<K>) -> bool {
-        // SAFETY: Forwarded from the caller.
-        unsafe { self.answer_slot(idx).rollback_reserved_if_pending() }
     }
 
     fn answer_slot_hashed(&self, key: Hashed<&K>) -> Option<SolutionSlot<'_, K::Answer>> {
@@ -830,60 +799,6 @@ impl SolutionsData {
         let mut table = SolutionsTable::default();
         table_mut_for_each!(&mut table, |items| presize(items, bindings));
         Self { table }
-    }
-
-    fn get_idx<K: Keyed>(&self, idx: Idx<K>) -> Option<&K::Answer>
-    where
-        SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
-    {
-        self.table.get::<K>().get(idx)
-    }
-
-    pub(crate) fn record<K: Keyed>(
-        &self,
-        idx: Idx<K>,
-        answer: AnswerBox<K::Answer>,
-    ) -> (&K::Answer, bool)
-    where
-        SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
-    {
-        self.table.get::<K>().record(idx, answer)
-    }
-
-    fn record_alias<K: Keyed>(&self, idx: Idx<K>, target: Idx<K>) -> (&K::Answer, bool)
-    where
-        SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
-    {
-        self.table.get::<K>().record_alias(idx, target)
-    }
-
-    fn reserve<K: Keyed>(&self, idx: Idx<K>, answer: AnswerBox<K::Answer>) -> bool
-    where
-        SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
-    {
-        self.table.get::<K>().reserve(idx, answer)
-    }
-
-    /// # Safety
-    ///
-    /// The caller must own the reservation for `idx`'s slot.
-    unsafe fn publish_reserved<K: Keyed>(&self, idx: Idx<K>)
-    where
-        SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
-    {
-        // SAFETY: Forwarded from the caller.
-        unsafe { self.table.get::<K>().publish_reserved(idx) }
-    }
-
-    /// # Safety
-    ///
-    /// The caller must own the reservation for `idx`'s slot.
-    unsafe fn rollback_reserved_if_pending<K: Keyed>(&self, idx: Idx<K>) -> bool
-    where
-        SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
-    {
-        // SAFETY: Forwarded from the caller.
-        unsafe { self.table.get::<K>().rollback_reserved_if_pending(idx) }
     }
 }
 
@@ -1182,22 +1097,16 @@ impl Solutions {
         });
     }
 
-    /// Record exports that changed between new solutions (self) and old answers
-    /// (bindings + answers) into `changed`. This is used when the old solutions
-    /// were None but old answers exist — e.g., the module was previously only
-    /// computed up to Answers and is now computed to Solutions for the first time.
+    /// Record exports that changed between new solutions (self) and old `Answers`
+    /// into `changed`. This is used when the old solutions were None but old answers
+    /// exist — e.g., the module was previously only computed up to Answers and is
+    /// now computed to Solutions for the first time.
     ///
     /// If a calculation in old answers was never forced, we skip it — nothing
     /// could have depended on it, so there's no change to propagate.
-    pub fn changed_exports_vs_answers(
-        &self,
-        old_bindings: &Bindings,
-        old_answers: &Answers,
-        changed: &mut ModuleChanges,
-    ) {
+    pub fn changed_exports_vs_answers(&self, old_answers: &Answers, changed: &mut ModuleChanges) {
         fn check_table_vs_answers<K: Keyed>(
             new_solutions: &SolutionsEntry<K>,
-            old_bindings: &Bindings,
             old_answers: &Answers,
             ctx: &mut TypeEqCtx,
             changed: &mut ModuleChanges,
@@ -1209,6 +1118,7 @@ impl Solutions {
             if !K::EXPORTED {
                 return;
             }
+            let old_bindings = old_answers.bindings();
 
             for (k, slot) in new_solutions.answer_slots() {
                 let new_val = slot.get();
@@ -1240,7 +1150,7 @@ impl Solutions {
         let mut ctx = TypeEqCtx::default();
 
         table_for_each!(self.data.table, |x| {
-            check_table_vs_answers(x, old_bindings, old_answers, &mut ctx, changed);
+            check_table_vs_answers(x, old_answers, &mut ctx, changed);
         });
     }
 
@@ -1318,12 +1228,7 @@ pub trait LookupAnswer: Sized {
 }
 
 impl Answers {
-    pub fn new(
-        bindings: &Bindings,
-        solver: Solver,
-        enable_index: bool,
-        enable_trace: bool,
-    ) -> Self {
+    pub fn new(bindings: Bindings, solver: Solver, enable_index: bool, enable_trace: bool) -> Self {
         fn presize<K: Keyed>(items: &mut AnswerEntry<K>, bindings: &Bindings)
         where
             BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
@@ -1334,8 +1239,8 @@ impl Answers {
             }
         }
         let mut table = AnswerTable::default();
-        table_mut_for_each!(&mut table, |items| presize(items, bindings));
-        let solutions = Arc::new(SolutionsData::new(bindings));
+        table_mut_for_each!(&mut table, |items| presize(items, &bindings));
+        let solutions = Arc::new(SolutionsData::new(&bindings));
         let index = if enable_index {
             Some(Arc::new(Mutex::new(Index::default())))
         } else {
@@ -1348,6 +1253,7 @@ impl Answers {
         };
 
         Self {
+            bindings,
             solver,
             table,
             solutions,
@@ -1360,6 +1266,22 @@ impl Answers {
         &self.table
     }
 
+    pub fn bindings(&self) -> &Bindings {
+        &self.bindings
+    }
+
+    fn answer_slot<K: Keyed>(&self, idx: Idx<K>) -> &AnswerSlot<K::Answer>
+    where
+        AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+        SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
+    {
+        if K::EXPORTED {
+            self.solutions.table.get::<K>().answer_slot(idx)
+        } else {
+            self.table.get::<K>().answer_slot(idx)
+        }
+    }
+
     pub(crate) fn record<K: Keyed>(
         &self,
         idx: Idx<K>,
@@ -1369,11 +1291,7 @@ impl Answers {
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
     {
-        if K::EXPORTED {
-            self.solutions.record(idx, answer)
-        } else {
-            self.table.get::<K>().record(idx, answer)
-        }
+        self.answer_slot(idx).record(answer)
     }
 
     pub(crate) fn record_alias<K: Keyed>(&self, idx: Idx<K>, target: Idx<K>) -> (&K::Answer, bool)
@@ -1381,11 +1299,10 @@ impl Answers {
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
     {
-        if K::EXPORTED {
-            self.solutions.record_alias(idx, target)
-        } else {
-            self.table.get::<K>().record_alias(idx, target)
-        }
+        let slot = self.answer_slot(idx);
+        let target = self.answer_slot(target);
+        // SAFETY: Both slots belong to this Answers table and are dropped together.
+        unsafe { slot.record_alias(target) }
     }
 
     pub(crate) fn reserve<K: Keyed>(&self, idx: Idx<K>, answer: AnswerBox<K::Answer>) -> bool
@@ -1393,11 +1310,7 @@ impl Answers {
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
     {
-        if K::EXPORTED {
-            self.solutions.reserve(idx, answer)
-        } else {
-            self.table.get::<K>().reserve(idx, answer)
-        }
+        self.answer_slot(idx).reserve(answer)
     }
 
     /// # Safety
@@ -1408,13 +1321,8 @@ impl Answers {
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
     {
-        if K::EXPORTED {
-            // SAFETY: Forwarded from the caller.
-            unsafe { self.solutions.publish_reserved(idx) }
-        } else {
-            // SAFETY: Forwarded from the caller.
-            unsafe { self.table.get::<K>().publish_reserved(idx) }
-        }
+        // SAFETY: Forwarded from the caller.
+        unsafe { self.answer_slot(idx).publish_reserved() }
     }
 
     /// # Safety
@@ -1425,13 +1333,8 @@ impl Answers {
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
     {
-        if K::EXPORTED {
-            // SAFETY: Forwarded from the caller.
-            unsafe { self.solutions.rollback_reserved_if_pending(idx) }
-        } else {
-            // SAFETY: Forwarded from the caller.
-            unsafe { self.table.get::<K>().rollback_reserved_if_pending(idx) }
-        }
+        // SAFETY: Forwarded from the caller.
+        unsafe { self.answer_slot(idx).rollback_reserved_if_pending() }
     }
 
     pub fn heap(&self) -> &TypeHeap {
@@ -1439,10 +1342,9 @@ impl Answers {
     }
 
     pub fn solve<Ans: LookupAnswer>(
-        &self,
+        self: &Arc<Self>,
         exports: &dyn LookupExport,
         answers: &Ans,
-        bindings: &Bindings,
         errors: &ErrorCollector,
         stdlib: &Stdlib,
         uniques: &UniqueFactory,
@@ -1451,6 +1353,8 @@ impl Answers {
         pysa_context: Option<&crate::report::pysa::context::ModuleAnswersContext>,
         enable_cinderx_solutions: bool,
     ) -> Solutions {
+        let bindings = self.bindings();
+
         fn pre_solve<Ans: LookupAnswer, K: Solve<Ans>>(
             _items: &SolutionsEntry<K>,
             answers: &AnswersSolver<Ans>,
@@ -1475,12 +1379,11 @@ impl Answers {
         let recurser = &VarRecurser::new();
         let thread_state = &ThreadState::new(recursion_limit_config);
         let answer_scope = &AnswerScope::new();
-        let jaxtyping_dims = RefCell::default();
+        let jaxtyping_quantifieds = RefCell::default();
         let answers_solver = AnswersSolver::new(
             answers,
             self,
             errors,
-            bindings,
             exports,
             uniques,
             recurser,
@@ -1488,13 +1391,20 @@ impl Answers {
             thread_state,
             answer_scope,
             self.heap(),
-            &jaxtyping_dims,
+            &jaxtyping_quantifieds,
         );
         table_for_each!(&self.solutions.table, |items| pre_solve(
             items,
             &answers_solver,
             compute_everything
         ));
+        // Every binding is solved, so every variable a trace mentions now has an answer. Force
+        // them here, once, rather than on every read. This must precede any trace consumer below.
+        if let Some(trace_store) = &self.trace {
+            trace_store
+                .lock()
+                .visit_mut(&mut |ty| self.solver.force_mut(ty));
+        }
         // `pre_solve` has published every exported slot. From this point on,
         // the preallocated solutions table represents a complete result set.
         if let Some(index) = &self.index {
@@ -1541,7 +1451,7 @@ impl Answers {
 
         let pysa_solutions = pysa_context.map(PysaSolutions::build);
         let cinderx_solutions =
-            enable_cinderx_solutions.then(|| CinderxSolutions::build(bindings, &answers_solver));
+            enable_cinderx_solutions.then(|| CinderxSolutions::build(&answers_solver));
 
         answers_solver.validate_final_thread_state();
 
@@ -1557,10 +1467,9 @@ impl Answers {
     }
 
     pub fn solve_exported_key<'ctx, 'answer, Ans: LookupAnswer, K: Solve<Ans> + Exported>(
-        &'answer self,
+        self: &'answer Arc<Self>,
         exports: &'ctx dyn LookupExport,
         answers: &'ctx Ans,
-        bindings: &'answer Bindings,
         errors: &'ctx ErrorCollector,
         stdlib: &'ctx Stdlib,
         uniques: &'ctx UniqueFactory,
@@ -1573,6 +1482,8 @@ impl Answers {
         BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
         SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
     {
+        let bindings = self.bindings();
+
         // Fast path: check if the answer has already been published in its result slot.
         // This avoids constructing a VarRecurser and AnswersSolver when the value is cached.
         if let Some(idx) = bindings.key_to_idx_hashed_opt(key)
@@ -1582,12 +1493,11 @@ impl Answers {
         }
         // Slow path: need to compute the answer.
         let recurser = &VarRecurser::new();
-        let jaxtyping_dims = RefCell::default();
+        let jaxtyping_quantifieds = RefCell::default();
         let solver = AnswersSolver::new(
             answers,
             self,
             errors,
-            bindings,
             exports,
             uniques,
             recurser,
@@ -1595,7 +1505,7 @@ impl Answers {
             thread_state,
             answer_scope,
             self.heap(),
-            &jaxtyping_dims,
+            &jaxtyping_quantifieds,
         );
         solver.get_hashed_opt(key)
     }
@@ -1606,11 +1516,7 @@ impl Answers {
         AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
         SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
     {
-        if K::EXPORTED {
-            self.solutions.get_idx(k)
-        } else {
-            self.table.get::<K>().get(k)
-        }
+        self.answer_slot(k).get()
     }
 
     /// Drive a cross-module iteration member by constructing a temporary
@@ -1620,10 +1526,9 @@ impl Answers {
     /// is stored in SCC iteration state on the shared `CalcStack` (via
     /// `thread_state`), so the `get_idx` result is discarded.
     pub fn solve_idx_erased<Ans: LookupAnswer>(
-        &self,
+        self: &Arc<Self>,
         any_idx: &AnyIdx,
         answers: &Ans,
-        bindings: &Bindings,
         exports: &dyn LookupExport,
         errors: &ErrorCollector,
         stdlib: &Stdlib,
@@ -1632,12 +1537,11 @@ impl Answers {
         answer_scope: &AnswerScope,
     ) {
         let recurser = &VarRecurser::new();
-        let jaxtyping_dims = RefCell::default();
+        let jaxtyping_quantifieds = RefCell::default();
         let solver = AnswersSolver::new(
             answers,
             self,
             errors,
-            bindings,
             exports,
             uniques,
             recurser,
@@ -1645,7 +1549,7 @@ impl Answers {
             thread_state,
             answer_scope,
             self.heap(),
-            &jaxtyping_dims,
+            &jaxtyping_quantifieds,
         );
         dispatch_anyidx!(any_idx, solver, solve_idx_erased_typed);
     }
@@ -1714,10 +1618,6 @@ impl Answers {
         unsafe { self.rollback_reserved_if_pending(idx) }
     }
 
-    fn force_for_export_boundary(&self, t: Type) -> Type {
-        self.solver.for_export_boundary(t)
-    }
-
     pub fn solver(&self) -> &Solver {
         &self.solver
     }
@@ -1736,70 +1636,33 @@ impl Answers {
     }
 
     pub fn get_type_at(&self, idx: Idx<Key>) -> Option<Type> {
-        Some(self.force_for_export_boundary(self.get_idx(idx)?.ty().clone()))
-    }
-
-    pub fn get_type_at_for_display(&self, idx: Idx<Key>) -> Option<Type> {
-        Some(self.solver.for_display(self.get_idx(idx)?.ty().clone()))
+        Some(self.get_idx(idx)?.ty().clone())
     }
 
     pub fn get_type_trace(&self, range: TextRange) -> Option<Type> {
         let lock = self.trace.as_ref()?.lock();
-        Some(self.force_for_export_boundary(lock.types.get(&range)?.as_ref().clone()))
+        Some(lock.types.get(&range)?.as_ref().clone())
     }
 
     pub fn get_expected_type_trace(&self, range: TextRange) -> Option<Type> {
         let lock = self.trace.as_ref()?.lock();
-        Some(self.force_for_export_boundary(lock.expected_types.get(&range)?.as_ref().clone()))
-    }
-
-    pub fn get_type_trace_for_display(&self, range: TextRange) -> Option<Type> {
-        let lock = self.trace.as_ref()?.lock();
-        Some(
-            self.solver
-                .for_display(lock.types.get(&range)?.as_ref().clone()),
-        )
-    }
-
-    pub fn get_expected_type_trace_for_display(&self, range: TextRange) -> Option<Type> {
-        let lock = self.trace.as_ref()?.lock();
-        Some(
-            self.solver
-                .for_display(lock.expected_types.get(&range)?.as_ref().clone()),
-        )
+        Some(lock.expected_types.get(&range)?.as_ref().clone())
     }
 
     pub fn try_get_getter_for_range(&self, range: TextRange) -> Option<Type> {
         let lock = self.trace.as_ref()?.lock();
-        Some(self.force_for_export_boundary(lock.invoked_properties.get(&range)?.as_ref().clone()))
+        Some(lock.invoked_properties.get(&range)?.as_ref().clone())
     }
 
     pub fn get_chosen_overload_trace(&self, range: TextRange) -> Option<Type> {
         let lock = self.trace.as_ref()?.lock();
         match lock.overloaded_callees.get(&range)? {
-            OverloadedCallee::Resolved { callable } => {
-                Some(self.force_for_export_boundary(callable.as_type()))
-            }
+            OverloadedCallee::Resolved { callable } => Some(callable.as_type()),
             OverloadedCallee::Candidates {
                 closest,
                 is_closest_chosen,
                 ..
-            } if *is_closest_chosen => Some(self.force_for_export_boundary(closest.as_type())),
-            _ => None,
-        }
-    }
-
-    pub fn get_chosen_overload_trace_for_display(&self, range: TextRange) -> Option<Type> {
-        let lock = self.trace.as_ref()?.lock();
-        match lock.overloaded_callees.get(&range)? {
-            OverloadedCallee::Resolved { callable } => {
-                Some(self.solver.for_display(callable.as_type()))
-            }
-            OverloadedCallee::Candidates {
-                closest,
-                is_closest_chosen,
-                ..
-            } if *is_closest_chosen => Some(self.solver.for_display(closest.as_type())),
+            } if *is_closest_chosen => Some(closest.as_type()),
             _ => None,
         }
     }
@@ -1942,6 +1805,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 .push(attribute_reference_range);
                         }
                     }
+                    AttrDefinition::Synthetic => {}
                 }
             }
         }

@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::MutexGuard;
 use std::sync::RwLockReadGuard;
+use std::sync::RwLockWriteGuard;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -36,6 +37,7 @@ use pyrefly_python::module::Module;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
 use pyrefly_python::module_path::ModulePathDetails;
+use pyrefly_python::module_path::ModuleStyle;
 use pyrefly_python::sys_info::SysInfo;
 use pyrefly_types::type_alias::TypeAliasIndex;
 use pyrefly_util::arc_id::ArcId;
@@ -100,7 +102,6 @@ use crate::binding::binding::KeyVariance;
 use crate::binding::binding::Keyed;
 use crate::binding::bindings::BindingEntry;
 use crate::binding::bindings::BindingTable;
-use crate::binding::bindings::Bindings;
 use crate::binding::metadata::BindingsMetadata;
 use crate::binding::scope::builtin_module_for_name;
 use crate::binding::table::TableKeyed;
@@ -465,7 +466,7 @@ impl ModuleDep {
 #[derive(Debug, Default)]
 pub(crate) struct OldData {
     pub exports: Option<Arc<Exports>>,
-    pub answers: Option<Arc<(Bindings, Arc<Answers>)>>,
+    pub answers: Option<Arc<Answers>>,
     pub solutions: Option<Arc<Solutions>>,
 }
 
@@ -694,7 +695,7 @@ pub(crate) struct TransactionData<'a> {
     pysa_reporter: Option<Box<crate::report::pysa::PysaReporter>>,
     /// When set, CinderX reporting writes per-module output during answer solving.
     cinderx_reporter: Option<Box<crate::report::cinderx::CinderxReporter>>,
-    /// When set, called per solved module while its bindings/answers are still live (before eviction).
+    /// When set, called per solved module while its answers are still live (before eviction).
     solutions_hook: Option<Box<dyn Fn(&Handle, &Transaction) + Send + Sync + 'a>>,
 }
 
@@ -836,7 +837,7 @@ impl<'a> Transaction<'a> {
         self.data.pysa_reporter = reporter;
     }
 
-    /// Set a hook called per solved module while its bindings/answers are still live (before
+    /// Set a hook called per solved module while its answers are still live (before
     /// eviction), letting per-module analyses (e.g. `coverage`) read them without retaining them.
     pub fn set_solutions_hook(
         &mut self,
@@ -907,24 +908,20 @@ impl<'a> Transaction<'a> {
         self.with_module_inner(handle, |x| x.get_solutions())
     }
 
-    pub fn get_bindings(&self, handle: &Handle) -> Option<Bindings> {
-        self.with_module_inner(handle, |x| x.get_answers().map(|a| a.0.dupe()))
-    }
-
     pub fn get_answers(&self, handle: &Handle) -> Option<Arc<Answers>> {
-        self.with_module_inner(handle, |x| x.get_answers().map(|a| a.1.dupe()))
+        self.with_module_inner(handle, |x| x.get_answers())
     }
 
     /// Look up the `ClassFields` for a class, which may be defined in another module.
-    /// Falls back to `Solutions` metadata when bindings are evicted (e.g. during `coverage`).
+    /// Falls back to `Solutions` metadata when answers are evicted (e.g. during `coverage`).
     pub fn get_class_fields(&self, source_handle: &Handle, class: &Class) -> Option<ClassFields> {
         let handle = Handle::new(
             class.module_name(),
             class.module_path().dupe(),
             source_handle.sys_info().dupe(),
         );
-        if let Some(bindings) = self.get_bindings(&handle) {
-            bindings.get_class_fields(class.index()).cloned()
+        if let Some(answers) = self.get_answers(&handle) {
+            answers.bindings().get_class_fields(class.index()).cloned()
         } else {
             Some(
                 self.get_solutions(&handle)?
@@ -1044,14 +1041,13 @@ impl<'a> Transaction<'a> {
             let dispatch_nanos = search_start.elapsed().as_nanos() as u64;
             max_dispatch_nanos.fetch_max(dispatch_nanos, Ordering::Relaxed);
             let _ = tasks.work(|_, modules| {
-                // Propagate transaction-level cancellation to the local TaskHeap
-                // so `work()` will stop popping chunks.
-                if transaction_cancelled.is_cancelled() {
-                    local_cancelled.cancel();
-                    return;
-                }
                 let mut thread_local_results = Vec::new();
                 for (handle, module_data) in modules {
+                    // Propagate transaction cancellation so `work()` stops taking chunks.
+                    if transaction_cancelled.is_cancelled() {
+                        local_cancelled.cancel();
+                        return;
+                    }
                     let exports_data = self.lookup_export(module_data);
                     let exports = exports_data.exports(&self.lookup(module_data));
                     thread_local_results.extend(searcher(handle, &exports_data, &exports));
@@ -1074,6 +1070,16 @@ impl<'a> Transaction<'a> {
 
     pub fn get_config_errors(&self) -> Vec<ConfigError> {
         self.data.state.config_finder.errors()
+    }
+
+    /// The `Require` level this transaction retains `handle` at, or `None` if
+    /// it has no such module.
+    pub fn get_require(&self, handle: &Handle) -> Option<Require> {
+        if let Some(v) = self.data.updated_modules.get(handle) {
+            Some(v.state.require())
+        } else {
+            self.readable.modules.get(handle).map(|v| v.state.require)
+        }
     }
 
     pub fn get_module_info(&self, handle: &Handle) -> Option<Module> {
@@ -1228,6 +1234,25 @@ impl<'a> Transaction<'a> {
                 .find_import(module, Some(handle.path()), Some(&self.timing)),
         };
         path.map(|path| Handle::new(module, path, handle.sys_info().dupe()))
+    }
+
+    /// Create a handle for source lookup, including modules replaced with `Any`.
+    pub(crate) fn import_handle_including_replaced(
+        &self,
+        handle: &Handle,
+        module: ModuleName,
+        preferred_style: ModuleStyle,
+        fallback_style: Option<ModuleStyle>,
+    ) -> FindingOrError<Handle> {
+        self.get_cached_loader(&self.get_module(handle).config.read())
+            .find_import_including_replaced(
+                module,
+                Some(handle.path()),
+                preferred_style,
+                fallback_style,
+                Some(&self.timing),
+            )
+            .map(|path| Handle::new(module, path, handle.sys_info().dupe()))
     }
 
     /// Create a handle for import `module` within the handle `handle`, preferring `.py` over `.pyi`
@@ -1503,8 +1528,8 @@ impl<'a> Transaction<'a> {
                 infer_return_types: config.infer_return_types(module_data.handle.path().as_path()),
                 infer_with_first_use: config
                     .infer_with_first_use(module_data.handle.path().as_path()),
-                check_all_matches: config.check_all_matches(module_data.handle.path().as_path()),
                 tensor_shapes,
+                jaxtyping: config.jaxtyping(module_data.handle.path().as_path()),
                 strict_callable_subtyping: config
                     .strict_callable_subtyping(module_data.handle.path().as_path()),
                 strict_partial_subtyping: config
@@ -1585,7 +1610,7 @@ impl<'a> Transaction<'a> {
                     // Old solutions were None but old exports existed — module
                     // was previously computed to Answers but not Solutions.
                     // Diff new solutions against old answers.
-                    new_solutions.changed_exports_vs_answers(&old_ans.0, &old_ans.1, &mut changed);
+                    new_solutions.changed_exports_vs_answers(&old_ans, &mut changed);
                 }
             }
             if !changed.is_empty() {
@@ -1622,8 +1647,8 @@ impl<'a> Transaction<'a> {
                 if let Some(hook) = &self.data.solutions_hook {
                     hook(&module_data.handle, self);
                 }
-                if !require.keep_bindings() && !require.keep_answers() {
-                    // From now on we can use the answers directly, so evict the bindings/answers.
+                if !require.keep_answers() {
+                    // From now on we can use the solutions directly, so evict the answers.
                     post.evict_answers();
                 }
                 load_result = module_data.state.get_load();
@@ -1922,10 +1947,11 @@ impl<'a> Transaction<'a> {
                         .expect("answers evicted implies solutions exist"),
                 ),
             });
-        let (bindings, answers) = match provider {
-            AnswerProvider::Answers(answers) => (&answers.0, answers.1.as_ref()),
+        let answers = match provider {
+            AnswerProvider::Answers(answers) => answers,
             AnswerProvider::Solutions(solutions) => return solutions.get_hashed_opt(key),
         };
+        let bindings = answers.bindings();
 
         // Fast path: check if the answer is already computed in the
         // result slot. This avoids constructing
@@ -1943,7 +1969,6 @@ impl<'a> Transaction<'a> {
         answers.solve_exported_key(
             &lookup,
             &lookup,
-            bindings,
             &load.errors,
             &stdlib,
             &self.data.state.uniques,
@@ -2287,20 +2312,19 @@ impl<'a> Transaction<'a> {
         let config = module_data.config.read();
         let thread_state = ThreadState::new(config.recursion_limit_config());
         let answer_scope = AnswerScope::new();
-        let jaxtyping_dims = RefCell::default();
+        let jaxtyping_quantifieds = RefCell::default();
         let solver = AnswersSolver::new(
             &lookup,
-            &answers.1,
+            &answers,
             errors,
-            &answers.0,
             &lookup,
             &self.data.state.uniques,
             &recurser,
             &stdlib,
             &thread_state,
             &answer_scope,
-            answers.1.heap(),
-            &jaxtyping_dims,
+            answers.heap(),
+            &jaxtyping_quantifieds,
         );
         let solve_timed = || {
             #[cfg(target_arch = "wasm32")]
@@ -2346,6 +2370,10 @@ impl<'a> Transaction<'a> {
 
     /// Invalidate based on what a watcher told you.
     pub fn invalidate_events(&mut self, events: &CategorizedEvents) {
+        let watched_metadata_changed = events
+            .iter()
+            .any(|path| ConfigFile::is_watched_metadata(path));
+
         // If any files were added or removed, we need to invalidate the find step.
         if !events.created.is_empty() || !events.removed.is_empty() || !events.unknown.is_empty() {
             self.invalidate_find();
@@ -2355,12 +2383,8 @@ impl<'a> Transaction<'a> {
         let files = events.iter().cloned().collect::<Vec<_>>();
         self.invalidate_disk(&files);
 
-        // If any config files changed, we need to invalidate the config step.
-        if events.iter().any(|x| {
-            x.file_name()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| ConfigFile::CONFIG_FILE_NAMES.contains(&x))
-        }) {
+        // Config and dependency metadata changes can change interpreter-derived settings.
+        if watched_metadata_changed {
             self.invalidate_config();
         }
     }
@@ -2540,10 +2564,10 @@ impl<'a> Transaction<'a> {
                 check_unannotated_defs: config.check_unannotated_defs(m.handle.path().as_path()),
                 infer_return_types: config.infer_return_types(m.handle.path().as_path()),
                 infer_with_first_use: config.infer_with_first_use(m.handle.path().as_path()),
-                check_all_matches: config.check_all_matches(m.handle.path().as_path()),
                 // This is a one-shot timing/diagnostic dump, so we intentionally do not
                 // store the bit on `module_data` (no later dirty.find() re-check applies).
                 tensor_shapes: self.tensor_shapes_available(&config, &m.handle, None),
+                jaxtyping: config.jaxtyping(m.handle.path().as_path()),
                 strict_callable_subtyping: config
                     .strict_callable_subtyping(m.handle.path().as_path()),
                 strict_partial_subtyping: config
@@ -2683,13 +2707,10 @@ impl<'a> Transaction<'a> {
         if let Some(cinderx_solutions) = solutions.cinderx_solutions() {
             return cinderx_solutions.clone();
         }
-        let bindings = self
-            .get_bindings(handle)
-            .expect("bindings must be available to build cinderx_solutions");
         let answers = self
             .get_answers(handle)
             .expect("answers must be available to build cinderx_solutions");
-        crate::report::cinderx::CinderxSolutions::build_from_answers(&bindings, &answers)
+        crate::report::cinderx::CinderxSolutions::build_from_answers(&answers)
     }
 }
 
@@ -2722,7 +2743,6 @@ enum TargetAnswers<'a> {
     /// The target module's `Answers` are available. The caller should perform
     /// its operation (commit or solve) using the contained data.
     Available {
-        bindings: Bindings,
         answers: Arc<Answers>,
         load: Option<Arc<Load>>,
         module_data: &'a ArcId<ModuleDataMut>,
@@ -2841,7 +2861,7 @@ impl<'a> TransactionHandle<'a> {
     /// This helper centralizes that logic and returns a `TargetAnswers`
     /// enum so callers only need to handle the "answers available" case.
     fn lookup_target_answers(&self, calc_id: &CalcId) -> TargetAnswers<'a> {
-        let CalcId(ref bindings, _) = *calc_id;
+        let bindings = calc_id.bindings();
         let module = bindings.module().name();
         let path = bindings.module().path();
 
@@ -2855,12 +2875,9 @@ impl<'a> TransactionHandle<'a> {
             None => return TargetAnswers::ModuleNotFound,
         };
 
-        if let Some(answers_pair) = module_data.state.get_answers() {
-            let bindings = answers_pair.0.dupe();
-            let answers = answers_pair.1.dupe();
+        if let Some(answers) = module_data.state.get_answers() {
             let load = module_data.state.get_load();
             TargetAnswers::Available {
-                bindings,
                 answers,
                 load,
                 module_data,
@@ -3199,7 +3216,6 @@ impl<'a> LookupAnswer for TransactionHandle<'a> {
             TargetAnswers::ModuleNotFound => false,
             TargetAnswers::Evicted => true,
             TargetAnswers::Available {
-                bindings: target_bindings,
                 answers: target_answers,
                 load,
                 module_data,
@@ -3213,7 +3229,6 @@ impl<'a> LookupAnswer for TransactionHandle<'a> {
                 target_answers.solve_idx_erased(
                     any_idx,
                     &lookup,
-                    &target_bindings,
                     &lookup,
                     &target_load.errors,
                     &stdlib,
@@ -3290,7 +3305,7 @@ impl<'a> LookupAnswer for TransactionHandle<'a> {
 
             let answers_guard = module_data.state.load_answers();
             if let Some(answers) = answers_guard.as_ref() {
-                return answers.0.metadata().dupe();
+                return answers.bindings().metadata().dupe();
             }
             let solutions_guard = module_data.state.load_solutions();
             let solutions = solutions_guard
@@ -3310,6 +3325,15 @@ impl<'a> LookupAnswer for TransactionHandle<'a> {
 pub struct CommittingTransaction<'a> {
     transaction: Transaction<'a>,
     committing_transaction_guard: MutexGuard<'a, ()>,
+}
+
+impl<'a> CommittingTransaction<'a> {
+    /// Give up the right to commit, keeping the transaction and its state read
+    /// lock. Unlike acquiring both locks, releasing one cannot deadlock, so
+    /// this imposes no ordering constraint on the caller.
+    pub fn downgrade(self) -> Transaction<'a> {
+        self.transaction
+    }
 }
 
 impl<'a> AsMut<Transaction<'a>> for CommittingTransaction<'a> {
@@ -3451,6 +3475,19 @@ impl State {
         let start = Timer::start();
         let readable = self.state.read();
         let state_lock_blocked = start.elapsed();
+        self.transaction_from_guard(readable, default_require, subscriber, state_lock_blocked)
+    }
+
+    /// Build a transaction over the state `readable` observes. Takes the guard
+    /// rather than acquiring one, so a caller already holding the read lock
+    /// reuses it instead of dropping it and racing for another.
+    fn transaction_from_guard<'a>(
+        &'a self,
+        readable: RwLockReadGuard<'a, StateData>,
+        default_require: Require,
+        subscriber: Option<Box<dyn Subscriber + 'a>>,
+        state_lock_blocked: Duration,
+    ) -> Transaction<'a> {
         let now = readable.now;
         let stdlib = readable.stdlib.clone();
         Transaction {
@@ -3521,11 +3558,42 @@ impl State {
         }
     }
 
-    pub fn commit_transaction(
-        &self,
-        transaction: CommittingTransaction,
+    pub fn commit_transaction<'a>(
+        &'a self,
+        transaction: CommittingTransaction<'a>,
         telemetry: Option<&mut TelemetryEvent>,
     ) {
+        // Callers that need to read what was committed use
+        // `commit_transaction_downgrade` instead.
+        drop(self.commit_transaction_inner(transaction, telemetry));
+    }
+
+    /// Commit, then downgrade the write guard and hand back a transaction over
+    /// the state just written. No other commit can land in between, so the
+    /// caller does not have to re-establish what it just committed.
+    pub fn commit_transaction_downgrade<'a>(
+        &'a self,
+        transaction: CommittingTransaction<'a>,
+        telemetry: Option<&mut TelemetryEvent>,
+        default_require: Require,
+    ) -> Transaction<'a> {
+        let state = self.commit_transaction_inner(transaction, telemetry);
+        // Already holding the lock, so there was nothing to wait for.
+        self.transaction_from_guard(
+            RwLockWriteGuard::downgrade(state),
+            default_require,
+            None,
+            Duration::ZERO,
+        )
+    }
+
+    /// Apply the transaction to shared state and hand back the write lock, so
+    /// the caller chooses whether to release or downgrade it.
+    fn commit_transaction_inner<'a>(
+        &'a self,
+        transaction: CommittingTransaction<'a>,
+        telemetry: Option<&mut TelemetryEvent>,
+    ) -> RwLockWriteGuard<'a, StateData> {
         debug!("Committing transaction");
         let CommittingTransaction {
             transaction:
@@ -3614,7 +3682,8 @@ impl State {
             }
         }
 
-        drop(committing_transaction_guard)
+        drop(committing_transaction_guard);
+        state
     }
 
     pub fn run(

@@ -232,7 +232,7 @@ def precompute_freqs_cis(seq_len: int, n_elem: int, base: float = 10000) -> Tens
 
 
 def apply_rotary_emb[S: IntTuple](x: Tensor[S], freqs_cis: Tensor) -> Tensor[S]:
-    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)  # type: ignore[bad-argument-type]
+    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)  # type: ignore[pyrefly:bad-argument-type]
     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
         [
@@ -242,7 +242,7 @@ def apply_rotary_emb[S: IntTuple](x: Tensor[S], freqs_cis: Tensor) -> Tensor[S]:
         -1,
     )
     x_out2 = x_out2.flatten(3)
-    return x_out2.type_as(x)  # type: ignore[bad-return]  # shape preserved — rotary doesn't change dims
+    return x_out2.type_as(x)  # type: ignore[pyrefly:bad-return, pyrefly:bad-argument-type]  # shape preserved — rotary doesn't change dims
 
 
 class Attention[D: IntVar, NHead: IntVar, NLocalHead: IntVar, HD: IntVar](nn.Module):
@@ -449,6 +449,7 @@ class Transformer(nn.Module):
             raise AssertionError("Caches must be initialized first")
         mask = self.causal_mask[None, None, input_pos]
         assert_type(mask, Tensor)  # bare — indexing with None/input_pos
+        # An optional tensor index uses the gradual fallback overload.
         freqs_cis = self.freqs_cis[input_pos]
         assert_type(freqs_cis, Tensor)  # bare — indexing on bare freqs_cis
         # ModelArgs uses plain int — sub-module dims are Unknown

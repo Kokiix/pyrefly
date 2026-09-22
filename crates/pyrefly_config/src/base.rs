@@ -6,11 +6,15 @@
  */
 
 use std::collections::HashMap;
+use std::fmt;
+use std::fmt::Display;
+use std::fmt::Formatter;
 
 use clap::ValueEnum;
 use enum_iterator::Sequence;
 use enum_iterator::all;
 use pyrefly_python::ignore::Tool;
+use pyrefly_python::ignore::TypeIgnoreUnknownTagBehavior;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_with::skip_serializing_none;
@@ -72,7 +76,17 @@ pub struct RecursionLimitConfig {
 /// the base configuration. User-specified settings merge on top, overriding
 /// the preset. Explicit configuration always wins over the preset regardless
 /// of order in the config file.
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone, Copy, Sequence)]
+#[derive(
+    Debug,
+    PartialEq,
+    Eq,
+    Deserialize,
+    Serialize,
+    Clone,
+    Copy,
+    Sequence,
+    Hash
+)]
 #[derive(ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Preset {
@@ -87,9 +101,8 @@ pub enum Preset {
     /// or assignment validation are disabled.
     Basic,
     /// A looser, less-strict preset useful for codebases migrating from mypy.
-    /// Pyrefly does not aim to mimic mypy's behavior precisely — this preset
-    /// just disables a few checks that mypy does not have, so migrating users
-    /// aren't hit with new errors for classes of issues mypy never flagged.
+    /// Pyrefly does not aim to mimic mypy's behavior precisely, but this preset
+    /// preserves selected defaults that otherwise produce new migration errors.
     Legacy,
     /// The default Pyrefly configuration. Equivalent to having no preset at all.
     Default,
@@ -168,9 +181,14 @@ impl Preset {
                 ]);
                 ConfigBase {
                     errors: Some(ErrorDisplayConfig::new(errors)),
+                    replace_untyped_imports_with_any: Some(vec![
+                        ModuleWildcard::new("*")
+                            .expect("the hardcoded module wildcard should be valid"),
+                    ]),
                     check_unannotated_defs: Some(false),
                     infer_return_types: Some(InferReturnTypes::Never),
                     legacy_overload_expansion: Some(true),
+                    type_ignore_unknown_tag_behavior: Some(TypeIgnoreUnknownTagBehavior::Suppress),
                     ..Default::default()
                 }
             }
@@ -210,6 +228,32 @@ impl Preset {
             }
         }
     }
+
+    /// Title-case name for user-facing UI surfaces such as the IDE status bar,
+    /// where the kebab-case config spelling reads poorly as a label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Preset::Off => "Off",
+            Preset::Basic => "Basic",
+            Preset::Legacy => "Legacy",
+            Preset::Default => "Default",
+            Preset::Strict => "Strict",
+            Preset::All => "All",
+        }
+    }
+}
+
+/// Renders the canonical kebab-case name, matching how the preset is spelled in
+/// a config file and on the command line.
+impl Display for Preset {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        // Derived from clap's `ValueEnum` rather than `Debug` so that any
+        // future multi-word variant renders as `strict-plus`, not `StrictPlus`.
+        let value = self
+            .to_possible_value()
+            .expect("Preset has no skipped variants");
+        f.write_str(value.get_name())
+    }
 }
 
 #[skip_serializing_none]
@@ -225,6 +269,9 @@ pub struct ConfigBase {
     /// Respect ignore directives from only these tools.
     pub enabled_ignores: Option<SmallSet<Tool>>,
 
+    /// How `# type: ignore[...]` comments with non-Pyrefly tags affect diagnostics.
+    pub type_ignore_unknown_tag_behavior: Option<TypeIgnoreUnknownTagBehavior>,
+
     /// Modules from which import errors should be ignored
     /// and the module should always be replaced with `typing.Any`
     #[serde(
@@ -239,6 +286,11 @@ pub struct ConfigBase {
     /// ignored. The module is only replaced with `typing.Any` if it can't be found.
     #[serde(skip_serializing_if = "crate::util::none_or_empty")]
     pub(crate) ignore_missing_imports: Option<Vec<ModuleWildcard>>,
+
+    /// Modules to replace with `typing.Any` when the installed package provides
+    /// neither stubs nor a `py.typed` marker.
+    #[serde(skip_serializing_if = "crate::util::none_or_empty")]
+    pub(crate) replace_untyped_imports_with_any: Option<Vec<ModuleWildcard>>,
 
     /// Deprecated: use `check-unannotated-defs` and `infer-return-types` instead.
     /// How should we handle analyzing and inferring the function signature if it's untyped?
@@ -277,9 +329,9 @@ pub struct ConfigBase {
     /// By default this is enabled.
     pub infer_with_first_use: Option<bool>,
 
-    /// Whether to check every match statement for exhaustiveness.
-    /// By default, only matches over closed subject types are checked.
-    pub check_all_matches: Option<bool>,
+    /// Whether to interpret jaxtyping annotations as tensor shapes.
+    /// By default this is disabled.
+    pub jaxtyping: Option<bool>,
 
     /// Deprecated: set the `pytorch-efficiency-lints` error kind in `[errors]` instead.
     /// Enable PyTorch efficiency lints that detect common GPU performance anti-patterns.
@@ -347,25 +399,28 @@ impl ConfigBase {
         }
     }
 
-    /// Resolve the deprecated `untyped_def_behavior` field into the two new fields
-    /// (`check_unannotated_defs` and `infer_return_types`).
-    /// New fields take precedence; the old field only fills in unset values.
-    pub fn resolve_legacy_untyped_def_behavior(&mut self) {
-        let Some(behavior) = self.untyped_def_behavior else {
-            return;
-        };
-        if self.check_unannotated_defs.is_none() {
-            self.check_unannotated_defs = Some(!matches!(
-                behavior,
-                UntypedDefBehavior::SkipAndInferReturnAny
-            ));
+    /// Resolve deprecated compatibility settings into their canonical fields.
+    pub fn resolve_legacy_settings(&mut self) {
+        if let Some(behavior) = self.untyped_def_behavior {
+            if self.check_unannotated_defs.is_none() {
+                self.check_unannotated_defs = Some(!matches!(
+                    behavior,
+                    UntypedDefBehavior::SkipAndInferReturnAny
+                ));
+            }
+            if self.infer_return_types.is_none() {
+                self.infer_return_types = Some(match behavior {
+                    UntypedDefBehavior::CheckAndInferReturnType => InferReturnTypes::Checked,
+                    UntypedDefBehavior::CheckAndInferReturnAny
+                    | UntypedDefBehavior::SkipAndInferReturnAny => InferReturnTypes::Never,
+                });
+            }
         }
-        if self.infer_return_types.is_none() {
-            self.infer_return_types = Some(match behavior {
-                UntypedDefBehavior::CheckAndInferReturnType => InferReturnTypes::Checked,
-                UntypedDefBehavior::CheckAndInferReturnAny
-                | UntypedDefBehavior::SkipAndInferReturnAny => InferReturnTypes::Never,
-            });
+
+        if self.pytorch_efficiency_lints == Some(true) {
+            self.errors
+                .get_or_insert_default()
+                .set_default_severity(ErrorKind::PytorchEfficiencyLints, Severity::Warn);
         }
     }
 
@@ -379,6 +434,10 @@ impl ConfigBase {
 
     pub(crate) fn get_ignore_missing_imports(base: &Self) -> Option<&[ModuleWildcard]> {
         base.ignore_missing_imports.as_deref()
+    }
+
+    pub(crate) fn get_replace_untyped_imports_with_any(base: &Self) -> Option<&[ModuleWildcard]> {
+        base.replace_untyped_imports_with_any.as_deref()
     }
 
     pub fn get_check_unannotated_defs(base: &Self) -> Option<bool> {
@@ -401,12 +460,18 @@ impl ConfigBase {
         base.infer_with_first_use
     }
 
-    pub fn get_check_all_matches(base: &Self) -> Option<bool> {
-        base.check_all_matches
+    pub fn get_jaxtyping(base: &Self) -> Option<bool> {
+        base.jaxtyping
     }
 
     pub fn get_enabled_ignores(base: &Self) -> Option<&SmallSet<Tool>> {
         base.enabled_ignores.as_ref()
+    }
+
+    pub fn get_type_ignore_unknown_tag_behavior(
+        base: &Self,
+    ) -> Option<TypeIgnoreUnknownTagBehavior> {
+        base.type_ignore_unknown_tag_behavior
     }
 
     /// Get the recursion limit configuration, if enabled.
@@ -461,14 +526,9 @@ mod tests {
     use super::*;
 
     /// Canonical kebab-case name for a preset, matching the serde/clap form
-    /// (e.g., `StrictPlus` → `"strict-plus"`). Derived from clap's `ValueEnum`
-    /// rather than `Debug` so multi-word variants work correctly.
+    /// (e.g., `StrictPlus` → `"strict-plus"`).
     fn preset_name(preset: Preset) -> String {
-        preset
-            .to_possible_value()
-            .expect("Preset is a ValueEnum")
-            .get_name()
-            .to_owned()
+        preset.to_string()
     }
 
     /// Render the contents of `scripts/error_presets.json`: for every error

@@ -932,8 +932,8 @@ def describe_int(x: int):
 );
 
 testcase!(
-    test_check_all_matches_reports_open_domains,
-    TestEnv::new().enable_check_all_matches(),
+    test_non_exhaustive_match_open_type_reports_open_domains,
+    TestEnv::new().enable_non_exhaustive_match_open_type_error(),
     r#"
 def describe_int(x: int):
     match x: # E: Match on `int` is not exhaustive
@@ -1835,6 +1835,65 @@ def keyed_pattern_does_not_narrow_else(x: dict | int) -> None:
             reveal_type(x)  # E: revealed type: dict[Unknown, Unknown]
         case _:
             reveal_type(x)  # E: revealed type: dict[Unknown, Unknown] | int
+"#,
+);
+
+// https://github.com/facebook/pyrefly/issues/4972
+testcase!(
+    test_match_tuple_optional_captures,
+    r#"
+from typing import assert_type
+def get_present_value(left: int | None, right: str | None) -> int | str:
+    match left, right:
+        case None, None:
+            raise ValueError("Both values are missing")
+        case value, None:
+            assert_type(value, int)
+            return value
+        case None, value:
+            assert_type(value, str)
+            return value
+        case _:
+            raise ValueError("Both values are present")
+
+def both_present(left: int | None, right: str | None) -> None:
+    match left, right:
+        case None, None:
+            pass
+        case value, None:
+            assert_type(value, int)
+        case None, value:
+            assert_type(value, str)
+        case a, b:
+            assert_type(a, int)
+            assert_type(b, str)
+
+def guarded(left: int | None, right: str | None, flag: bool) -> None:
+    match left, right:
+        case None, None if flag:
+            pass
+        case value, None:
+            assert_type(value, int | None)
+        case None, value:
+            assert_type(value, str)
+
+def incomplete(left: int | None, right: str | None) -> None:
+    match left, right:
+        case value, None:
+            assert_type(value, int | None)
+        case None, value:
+            assert_type(value, str)
+
+def three_elements(a: int | None, b: str | None, c: bytes | None) -> None:
+    match a, b, c:
+        case None, None, None:
+            pass
+        case x, None, None:
+            assert_type(x, int)
+        case None, y, None:
+            assert_type(y, str)
+        case None, None, z:
+            assert_type(z, bytes)
 "#,
 );
 

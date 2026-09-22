@@ -279,6 +279,9 @@ enum StaticStyle {
 struct MutableCapture {
     kind: MutableCaptureKind,
     original: Result<Box<StaticInfo>, MutableCaptureError>,
+    /// Does the declaring scope itself give the name a value (e.g. `global x; x = 1`)?
+    /// Such a capture creates the outer-scope name instead of requiring one to exist.
+    has_value_definition: bool,
 }
 
 impl MutableCapture {
@@ -348,6 +351,7 @@ impl StaticStyle {
                     Self::MutableCapture(MutableCapture {
                         kind: *kind,
                         original,
+                        has_value_definition: definition.has_value_definition,
                     })
                 }
                 DefinitionStyle::Annotated(.., ann) => {
@@ -1408,8 +1412,9 @@ pub struct Scope {
     variables: SmallMap<Name, VariableUsage>,
     /// Depth of finally blocks we're in. Resets in new function scopes (PEP 765).
     finally_depth: usize,
-    /// Depth of with blocks we're in. Resets in new function scopes.
-    with_depth: usize,
+    /// Stack of active `with` bodies, recording whether each has encountered a live
+    /// statement that may raise. Resets in new function scopes.
+    with_may_raise: Vec<bool>,
     /// Names that are read but not locally defined in this scope — implicit captures
     /// from enclosing scopes. Populated during `init_current_static` from the
     /// `Definitions` phase. Used to seed flow entries for captured variables.
@@ -1441,7 +1446,7 @@ impl Scope {
             has_future_annotations: false,
             variables: SmallMap::new(),
             finally_depth: 0,
-            with_depth: 0,
+            with_may_raise: Vec::new(),
             implicit_captures: SmallSet::new(),
             shadowed_implicit_builtins: SmallMap::new(),
             final_names: SmallSet::new(),
@@ -1780,12 +1785,24 @@ impl Scopes {
 
     /// Enter a with block.
     pub fn enter_with(&mut self) {
-        self.current_mut().with_depth += 1;
+        self.current_mut().with_may_raise.push(false);
     }
 
-    /// Exit a with block.
-    pub fn exit_with(&mut self) {
-        self.current_mut().with_depth -= 1;
+    /// Exit a with block and return whether an operation in its body may have raised.
+    pub fn exit_with(&mut self) -> bool {
+        self.current_mut()
+            .with_may_raise
+            .pop()
+            .expect("exit_with must match an active with body")
+    }
+
+    /// Record a live statement that may raise in every active `with` body. An exception
+    /// propagates through nested context managers until one of them suppresses it.
+    pub fn record_may_raise_in_with(&mut self) {
+        if self.current().flow.has_terminated {
+            return;
+        }
+        self.current_mut().with_may_raise.fill(true);
     }
 
     /// Enter a finally block (PEP 765).
@@ -2251,6 +2268,26 @@ impl Scopes {
             return Some(static_info.range);
         }
         None
+    }
+
+    /// Does a `global` declaration of `name` in the current function/method scope
+    /// come with a value definition in that same scope (e.g. `global x; x = 1`)?
+    /// Such a declaration legally creates the module-level name at runtime, so it
+    /// must not be reported as referencing a missing outer definition.
+    pub fn global_capture_self_defined(&self, name: Hashed<&Name>) -> bool {
+        let current = self.current();
+        matches!(current.kind, ScopeKind::Function(_) | ScopeKind::Method(_))
+            && matches!(
+                current.stat.0.get_hashed(name),
+                Some(StaticInfo {
+                    style: StaticStyle::MutableCapture(MutableCapture {
+                        kind: MutableCaptureKind::Global,
+                        has_value_definition: true,
+                        ..
+                    }),
+                    ..
+                })
+            )
     }
 
     /// Check if a name has a nonlocal binding in an enclosing scope.
@@ -2838,17 +2875,45 @@ impl Scopes {
         mem::swap(&mut self.current_mut().flow, flow);
     }
     pub fn mark_flow_termination(&mut self, kind: TerminationKind) {
-        let inside_with = self.current().with_depth > 0;
         let flow = &mut self.current_mut().flow;
         flow.has_terminated = true;
         flow.terminated_by_raise = kind.raises();
-        if !inside_with && !matches!(kind, TerminationKind::StaticTest) {
+        if !matches!(kind, TerminationKind::StaticTest) {
             flow.is_definitely_unreachable = true;
         }
     }
 
     pub fn set_definitely_unreachable(&mut self, is_definitely_unreachable: bool) {
         self.current_mut().flow.is_definitely_unreachable = is_definitely_unreachable;
+    }
+
+    /// Snapshot the current flow's termination state, leaving it unchanged. Pass the
+    /// result back to [`Self::restore_termination`].
+    ///
+    /// Both flags must move together: `is_unreachable_from_static_test` is defined as
+    /// terminated-but-not-definitely-unreachable, so restoring only one of them puts the
+    /// flow in a state that suppresses diagnostics meant for version-gated code.
+    pub fn save_termination(&self) -> (bool, bool) {
+        let flow = &self.current().flow;
+        (flow.has_terminated, flow.is_definitely_unreachable)
+    }
+
+    /// [`Self::save_termination`], then mark the flow as not terminated.
+    pub fn take_termination(&mut self) -> (bool, bool) {
+        let saved = self.save_termination();
+        let flow = &mut self.current_mut().flow;
+        flow.has_terminated = false;
+        flow.is_definitely_unreachable = false;
+        saved
+    }
+
+    pub fn restore_termination(
+        &mut self,
+        (has_terminated, is_definitely_unreachable): (bool, bool),
+    ) {
+        let flow = &mut self.current_mut().flow;
+        flow.has_terminated = has_terminated;
+        flow.is_definitely_unreachable = is_definitely_unreachable;
     }
 
     /// Check if the current flow has definitely terminated (e.g., after a return, raise, break, or continue)
@@ -2896,6 +2961,7 @@ impl Scopes {
         let flow = &mut self.current_mut().flow;
         flow.has_terminated = false;
         flow.terminated_by_raise = false;
+        flow.is_definitely_unreachable = false;
         flow.last_stmt_expr = Some(last_statement_key);
     }
 
@@ -3058,71 +3124,85 @@ impl Scopes {
             })
             .collect();
 
-        class_body.stat.0.iter_hashed().for_each(
-            |(name, static_info)| {
-            if matches!(static_info.style, StaticStyle::MutableCapture(..)) {
-                // Mutable captures are not actually owned by the class scope, and do not become attributes.
-            } else if let Some(value) = class_body.flow.get_info_hashed(name).and_then(|flow| flow.value()) {
-                let definition = match &value.style {
-                    FlowStyle::FunctionDef {
-                        has_return_annotation,
-                        ..
-                    } => ClassFieldDefinition::MethodLike {
-                        definition: value.idx,
-                        has_return_annotation: *has_return_annotation,
-                        annotation: static_info.annotation(),
-                    },
-                    // Only treat pristine class definitions as nested classes.
-                    // A non-pristine `ClassDef` carries the class identity for
-                    // receiver checking but its visible binding is a
-                    // `Binding::NameAssign`, so it must not become a nested
-                    // class. (This case is unreachable in current code because
-                    // class-body assignments always produce `ClassField`, but
-                    // the pattern is restricted here so that lifting that
-                    // restriction in a follow-up does not silently promote
-                    // rebound names to nested-class semantics.)
-                    FlowStyle::ClassDef { pristine: true, .. } => ClassFieldDefinition::NestedClass {
-                        definition: value.idx,
-                    },
-                    FlowStyle::ClassField {
-                        initial_value: Some(e),
-                    } => {
-                        // Detect if this is an alias (value is a simple name referring to another field
-                        // that was defined before this one in source order).
-                        let mut alias_of = None;
-                        if let Expr::Name(name_expr) = &e {
-                            let target_name = &name_expr.id;
-                            // Check if this name is another field in the class defined before this one.
-                            // We use source order (target ends before this field starts) to ensure
-                            // deterministic behavior regardless of hash map iteration order.
-                            if let Some(target_info) = class_body.stat.0.get(target_name)
-                                && target_info.range.end() <= static_info.range.start()
-                            {
-                                alias_of = Some(target_name.clone());
+        class_body
+            .stat
+            .0
+            .iter_hashed()
+            .for_each(|(name, static_info)| {
+                if matches!(static_info.style, StaticStyle::MutableCapture(..)) {
+                    // Mutable captures are not actually owned by the class scope, and do not become attributes.
+                } else if let Some(value) = class_body
+                    .flow
+                    .get_info_hashed(name)
+                    .and_then(|flow| flow.value())
+                {
+                    let definition = match &value.style {
+                        FlowStyle::FunctionDef {
+                            has_return_annotation,
+                            ..
+                        } => ClassFieldDefinition::MethodLike {
+                            definition: value.idx,
+                            has_return_annotation: *has_return_annotation,
+                            annotation: static_info.annotation(),
+                        },
+                        // Only treat pristine class definitions as nested classes.
+                        // A non-pristine `ClassDef` carries the class identity for
+                        // receiver checking but its visible binding is a
+                        // `Binding::NameAssign`, so it must not become a nested
+                        // class. (This case is unreachable in current code because
+                        // class-body assignments always produce `ClassField`, but
+                        // the pattern is restricted here so that lifting that
+                        // restriction in a follow-up does not silently promote
+                        // rebound names to nested-class semantics.)
+                        FlowStyle::ClassDef { pristine: true, .. } => {
+                            ClassFieldDefinition::NestedClass {
+                                definition: value.idx,
                             }
                         }
-                        ClassFieldDefinition::AssignedInBody {
-                            value: Box::new(ExprOrBinding::Expr(e.clone())),
-                            annotation: static_info.annotation(),
-                            alias_of,
+                        FlowStyle::ClassField {
+                            initial_value: Some(e),
+                        } => {
+                            // Detect if this is an alias (value is a simple name referring to another field
+                            // that was defined before this one in source order).
+                            let mut alias_of = None;
+                            if let Expr::Name(name_expr) = &e {
+                                let target_name = &name_expr.id;
+                                // Check if this name is another field in the class defined before this one.
+                                // We use source order (target ends before this field starts) to ensure
+                                // deterministic behavior regardless of hash map iteration order.
+                                if let Some(target_info) = class_body.stat.0.get(target_name)
+                                    && target_info.range.end() <= static_info.range.start()
+                                {
+                                    alias_of = Some(target_name.clone());
+                                }
+                            }
+                            ClassFieldDefinition::AssignedInBody {
+                                value: Box::new(ExprOrBinding::Expr(e.clone())),
+                                annotation: static_info.annotation(),
+                                alias_of,
+                            }
                         }
-                    }
-                    FlowStyle::ClassField {
-                        initial_value: None,
-                    } => ClassFieldDefinition::DeclaredByAnnotation {
-                        annotation: static_info.annotation().unwrap_or_else(
-                            || panic!("A class field known in the body but uninitialized always has an annotation.")
-                        ),
-                        initialized_in_recognized_method: recognized_instance_attrs
-                            .contains(name.key().as_str()),
-                    },
-                    _ => ClassFieldDefinition::DefinedWithoutAssign {
-                        definition: value.idx,
-                    },
-                };
-                field_definitions.insert_hashed(name.owned(), (definition, static_info.range));
-            }
-        });
+                        FlowStyle::ClassField {
+                            initial_value: None,
+                        } => match static_info.annotation() {
+                            Some(annotation) => ClassFieldDefinition::DeclaredByAnnotation {
+                                annotation,
+                                initialized_in_recognized_method: recognized_instance_attrs
+                                    .contains(name.key().as_str()),
+                            },
+                            // A `global` or `nonlocal` declaration makes the name a mutable
+                            // capture of a binding in another scope, which carries no
+                            // annotation of its own. Python rejects annotating such a name,
+                            // but we still have to describe the field it leaves behind.
+                            None => ClassFieldDefinition::DeclaredWithoutAnnotation,
+                        },
+                        _ => ClassFieldDefinition::DefinedWithoutAssign {
+                            definition: value.idx,
+                        },
+                    };
+                    field_definitions.insert_hashed(name.owned(), (definition, static_info.range));
+                }
+            });
         // Merge assignments from different methods.
         // `method_attrs` yields attributes from recognized constructor methods first (e.g. __init__),
         // followed by other helper methods.
@@ -3752,12 +3832,24 @@ struct MergeItem {
     branches: Vec<MergeBranchEntry>,
 }
 
+/// The key a flow merge will bind, if it turns out to need a binding at all.
+///
+/// A loop promises its phi keys up front (see `insert_phi_keys`) so that flows
+/// inside the loop body can refer to them, which is what `promised` records. A
+/// promise obliges us to produce a binding even when the merge collapses to a
+/// single branch. Without a promise nothing can refer to the phi, so a merge
+/// that collapses to a single branch introduces no key at all.
+struct PhiKey {
+    key: Key,
+    promised: Option<Idx<Key>>,
+}
+
 impl<'a> BindingsBuilder<'a> {
-    /// Create the idx of a merged type from the idxs of the branch types
+    /// The idx holding the merged type, given the idxs of the branch types.
     fn merge_idxs(
         &mut self,
         branch_idxs: SmallSet<Idx<Key>>,
-        phi_idx: Idx<Key>,
+        phi_key: PhiKey,
         loop_prior: Option<Idx<Key>>,
         join_style: JoinStyle<Idx<Key>>,
         branch_infos: Vec<BranchInfo>,
@@ -3767,32 +3859,34 @@ impl<'a> BindingsBuilder<'a> {
             // - the name was defined in the base flow and no branch modified it
             // - we're in a loop and there were only narrows
             // - the name was defined in only one branch
-            // In all three cases, we can avoid a Phi and just forward to the one idx.
+            // In all three cases the merged flow is just the one idx, so the phi is
+            // needed only to honour a promise the loop setup already made.
             let idx = *branch_idxs.first().unwrap();
-            self.insert_binding_idx(phi_idx, Binding::Forward(idx));
+            if let Some(phi_idx) = phi_key.promised {
+                self.insert_binding_idx(phi_idx, Binding::Forward(idx));
+            }
             idx
-        } else if let Some(loop_prior) = loop_prior {
-            self.insert_binding_idx(
-                phi_idx,
-                Binding::LoopPhi(Box::new((loop_prior, branch_idxs))),
-            );
-            phi_idx
         } else {
-            self.insert_binding_idx(
-                phi_idx,
-                Binding::Phi(join_style, branch_infos.into_boxed_slice()),
-            );
+            let phi_idx = match phi_key.promised {
+                Some(phi_idx) => phi_idx,
+                None => self.idx_for_promise(phi_key.key),
+            };
+            let binding = match loop_prior {
+                Some(loop_prior) => Binding::LoopPhi(Box::new((loop_prior, branch_idxs))),
+                None => Binding::Phi(join_style, branch_infos.into_boxed_slice()),
+            };
+            self.insert_binding_idx(phi_idx, binding);
             phi_idx
         }
     }
 
-    /// Get the flow info for an item in the merged flow, which is a combination
-    /// of the `phi_key` that will have the merged type information and the merged
-    /// flow styles.
+    /// Get the flow info for an item in the merged flow, which combines the idx
+    /// holding the merged type information with the merged flow styles.
     ///
-    /// The binding for the phi key is typically a Phi, but if this merge is from a loop
-    /// we'll use a LoopPhi, and if all branches were the same we'll just use a
-    /// Forward instead.
+    /// That idx is the phi whenever the merge produces one — a Phi, or a LoopPhi
+    /// if the merge is from a loop — and otherwise the single branch the merge
+    /// collapsed to. A collapsed merge binds a Forward under the phi key only to
+    /// honour a promise a loop already made.
     ///
     /// The default value will depend on whether we are still in a loop after the
     /// current merge. If so, we preserve the existing default; if not, the
@@ -3800,11 +3894,13 @@ impl<'a> BindingsBuilder<'a> {
     fn merged_flow_info(
         &mut self,
         merge_item: MergeItem,
-        phi_idx: Idx<Key>,
+        phi_key: PhiKey,
         merge_style: MergeStyle,
         n_branches: usize,
         n_branches_with_termination_key: usize,
     ) -> FlowInfo {
+        // Only a promised phi can already appear in a branch's flow.
+        let phi_idx = phi_key.promised;
         let base_idx = merge_item.base.as_ref().map(|base| base.idx());
         let mut merge_branches = merge_item.branches;
         // Track if base has a value for this name (for LoopDefinitelyRuns init check)
@@ -3873,7 +3969,7 @@ impl<'a> BindingsBuilder<'a> {
             // a narrow if one exists, otherwise the value. Each branch may have a
             // termination key, which potentially causes us to ignore it in the Phi based
             // on Never/NoReturn type information.
-            if branch_idx != phi_idx {
+            if Some(branch_idx) != phi_idx {
                 branch_infos.push(BranchInfo {
                     value_key: branch_idx,
                     termination_key: merge_branch.termination_key,
@@ -3888,7 +3984,7 @@ impl<'a> BindingsBuilder<'a> {
                 if !is_uninitialized {
                     n_values += 1;
                 }
-                if v.idx == phi_idx {
+                if Some(v.idx) == phi_idx {
                     // If uninitialized, still track termination key before continuing.
                     if is_uninitialized && let Some(termination_key) = merge_branch.termination_key
                     {
@@ -3953,7 +4049,7 @@ impl<'a> BindingsBuilder<'a> {
             0 => {
                 let merged_idx = self.merge_idxs(
                     branch_idxs,
-                    phi_idx,
+                    phi_key,
                     loop_prior,
                     base_idx.map_or(JoinStyle::SimpleMerge, JoinStyle::NarrowOf),
                     branch_infos.clone(),
@@ -3971,7 +4067,7 @@ impl<'a> BindingsBuilder<'a> {
             1 => {
                 let merged_idx = self.merge_idxs(
                     branch_idxs,
-                    phi_idx,
+                    phi_key,
                     loop_prior,
                     base_idx.map_or(JoinStyle::SimpleMerge, JoinStyle::NarrowOf),
                     branch_infos.clone(),
@@ -3992,7 +4088,7 @@ impl<'a> BindingsBuilder<'a> {
             _ => {
                 let merged_idx = self.merge_idxs(
                     branch_idxs,
-                    phi_idx,
+                    phi_key,
                     loop_prior,
                     base_idx.map_or(JoinStyle::SimpleMerge, JoinStyle::ReassignmentOf),
                     branch_infos,
@@ -4045,19 +4141,12 @@ impl<'a> BindingsBuilder<'a> {
         } else {
             live_branches
         };
-        // Determine reachability of the merged flow.
-        // For Loop style with empty flows (all branches terminated), the loop body might
-        // never execute (empty iterable), so we use the base flow's reachability.
-        // For LoopDefinitelyRuns, the loop definitely runs, so if all branches terminated,
-        // the flow is unreachable.
-        let all_are_unreachable = if flows.is_empty() {
-            match merge_style {
-                MergeStyle::Loop => base.is_definitely_unreachable,
-                _ => true,
-            }
-        } else {
-            flows.iter().all(|f| f.is_definitely_unreachable)
-        };
+        // A plain `Loop` may skip its body entirely, so the pre-loop flow stays a possible
+        // path past it. `LoopDefinitelyRuns` means the body runs at least once, so it does
+        // not.
+        let all_are_unreachable = (!matches!(merge_style, MergeStyle::Loop)
+            || base.is_definitely_unreachable)
+            && flows.iter().all(|f| f.is_definitely_unreachable);
 
         // For a regular loop, we merge the base so there's one extra branch being merged.
         // For LoopDefinitelyRuns, we don't count the base as an extra branch because we
@@ -4114,10 +4203,14 @@ impl<'a> BindingsBuilder<'a> {
         // For each name and merge item, produce the merged FlowInfo for our new Flow
         let mut merged_flow_infos = SmallMap::with_capacity(merge_items.len());
         for (name, merge_item) in merge_items.into_iter_hashed() {
-            let phi_idx = self.idx_for_promise(Key::Phi(Box::new((name.key().clone(), range))));
+            let key = Key::Phi(Box::new((name.key().clone(), range)));
+            let phi_key = PhiKey {
+                promised: self.promised_idx(&key),
+                key,
+            };
             let flow_info = self.merged_flow_info(
                 merge_item,
-                phi_idx,
+                phi_key,
                 merge_style,
                 n_branches,
                 n_branches_with_termination_key,
@@ -4212,7 +4305,6 @@ impl<'a> BindingsBuilder<'a> {
         // it is as long as it's different from the loop's range.
         let other_range = TextRange::new(range.start(), range.start());
         // Create the loopback merge, which is the flow at the top of the loop.
-        // Use LoopDefinitelyRuns when we know the loop will execute at least once.
         let merge_style = if loop_definitely_runs {
             MergeStyle::LoopDefinitelyRuns
         } else {

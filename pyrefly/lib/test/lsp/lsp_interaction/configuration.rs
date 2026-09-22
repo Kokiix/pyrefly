@@ -84,9 +84,9 @@ fn setup_dummy_interpreter(custom_interpreter_path: &Path) -> PathBuf {
     // This simulates what a real Python interpreter would return when queried with the env script
     let python_script = format!(
         r#"#!/usr/bin/env bash
-if [[ "$1" == "-c" && "$2" == *"import json, sys"* ]]; then
+if [[ "$1" == "-c" && "$2" == *"import importlib.metadata, json, sys, sysconfig"* ]]; then
     cat << 'EOF'
-{{"python_platform": "linux", "python_version": "3.12.0", "site_package_path": ["{site_packages}"]}}
+{{"python_platform": "linux", "python_version": "3.12.0", "site_package_path": ["{site_packages}"], "distribution_urls": []}}
 EOF
 else
     echo "Mock python interpreter - args: $@" >&2
@@ -358,6 +358,146 @@ fn test_workspace_pythonpath_ignored_when_set_in_config_file() {
         .unwrap();
 
     interaction.shutdown().expect("Failed to shutdown");
+}
+
+// A config with `skip-interpreter-query = true` opts out of interpreter queries
+// entirely: a client-provided `pythonPath` must not be applied, even though it
+// would resolve the import. Regression test for the LSP eagerly querying (and
+// applying) the client interpreter despite the opt-out.
+// Only run this test on unix since windows has no way to mock a .exe without compiling something
+// (we call python with python.exe)
+#[cfg(unix)]
+#[test]
+fn test_skip_interpreter_query_ignores_lsp_pythonpath() {
+    let test_files_root = get_test_files_root();
+    // This interpreter *would* resolve `custom_module` if it were applied, so the
+    // test distinguishes "pythonPath applied" (0 errors) from "pythonPath ignored
+    // because of `skip-interpreter-query`" (1 error).
+    let good_interpreter_path =
+        setup_dummy_interpreter(&test_files_root.path().join("custom_interpreter"));
+
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(test_files_root.path().to_path_buf());
+    interaction
+        .initialize(InitializeSettings {
+            configuration: Some(Some(
+                json!([{"pyrefly": {"displayTypeErrors": "force-on"}}]),
+            )),
+            ..Default::default()
+        })
+        .unwrap();
+
+    interaction
+        .client
+        .did_open("skip_interpreter_config/src/foo.py");
+    // `skip-interpreter-query = true` with no `site-package-path` in the config means
+    // the import cannot be resolved.
+    interaction
+        .client
+        .expect_publish_diagnostics_eventual_error_count(
+            test_files_root
+                .path()
+                .join("skip_interpreter_config/src/foo.py"),
+            1,
+        )
+        .unwrap();
+
+    // Even though this interpreter would resolve the import, the config opted out of
+    // interpreter queries, so the import error must persist.
+    interaction.client.did_change_configuration();
+    interaction
+        .client
+        .expect_request::<WorkspaceConfiguration>(json!({"items":[{"section":"python"}]}))
+        .unwrap()
+        .send_configuration_response(json!([
+            {
+                "pythonPath": good_interpreter_path.to_str().unwrap()
+            }
+        ]));
+    interaction
+        .client
+        .expect_publish_diagnostics_eventual_error_count(
+            test_files_root
+                .path()
+                .join("skip_interpreter_config/src/foo.py"),
+            1,
+        )
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+// A client-provided `pythonPath` fills in what the config left unset; it must not
+// discard what the config set explicitly. Regression test for the LSP replacing the
+// whole Python environment with the interpreter's, which dropped an explicit
+// `python-version` and silently type checked against the interpreter's version.
+// Only run this test on unix since windows has no way to mock a .exe without compiling something
+// (we call python with python.exe)
+#[cfg(unix)]
+#[test]
+fn test_config_python_version_survives_lsp_pythonpath() {
+    let test_files_root = get_test_files_root();
+    // This interpreter reports 3.12.0, disagreeing with the `python-version = "3.9"`
+    // in the fixture's config. The fixture's only error sits behind a
+    // `sys.version_info >= (3, 10)` guard, so it is reported iff the configured
+    // version was discarded in favor of the interpreter's.
+    let interpreter_path =
+        setup_dummy_interpreter(&test_files_root.path().join("custom_interpreter"));
+
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(test_files_root.path().to_path_buf());
+    interaction
+        .initialize(InitializeSettings {
+            configuration: Some(Some(
+                json!([{"pyrefly": {"displayTypeErrors": "force-on"}}]),
+            )),
+            initialization_options: Some(json!({
+                "pyrefly": {"streamDiagnostics": false},
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+
+    interaction
+        .client
+        .did_open("python_version_config/src/foo.py");
+    // Both the unresolved import and the `typing.override` error that the
+    // configured 3.9 produces before any interpreter is applied.
+    interaction
+        .client
+        .expect_publish_diagnostics_eventual_error_count(
+            test_files_root
+                .path()
+                .join("python_version_config/src/foo.py"),
+            2,
+        )
+        .unwrap();
+
+    interaction.client.did_change_configuration();
+    interaction
+        .client
+        .expect_request::<WorkspaceConfiguration>(json!({"items":[{"section":"python"}]}))
+        .unwrap()
+        .send_configuration_response(json!([
+            {
+                "pythonPath": interpreter_path.to_str().unwrap()
+            }
+        ]));
+    // The interpreter resolves the import, proving it was applied. The
+    // `typing.override` error remains, so `python-version` is still the
+    // configured 3.9; had it been overwritten with the interpreter's 3.12 that
+    // error would have disappeared too, leaving no diagnostics.
+    interaction
+        .client
+        .expect_publish_diagnostics_eventual_error_count(
+            test_files_root
+                .path()
+                .join("python_version_config/src/foo.py"),
+            1,
+        )
+        .unwrap();
+
+    interaction.shutdown().unwrap();
 }
 
 // Only run this test on unix since windows has no way to mock a .exe without compiling something

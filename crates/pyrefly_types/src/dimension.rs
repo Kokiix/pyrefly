@@ -193,7 +193,9 @@ fn type_var_restriction(ty: &Type) -> Option<&Restriction> {
 fn type_var_bound(ty: &Type) -> Option<&Type> {
     match type_var_restriction(ty)? {
         Restriction::Bound(bound) => Some(bound),
-        Restriction::Constraints(_) | Restriction::Flag(_) | Restriction::Unrestricted => None,
+        Restriction::Constraints(_)
+        | Restriction::ShapeExtension(_)
+        | Restriction::Unrestricted => None,
     }
 }
 
@@ -1271,6 +1273,10 @@ pub enum ShapeError {
     /// Too many indices for tensor rank
     TooManyIndices { got: usize, max: usize },
 
+    /// An indexing failure produced while evaluating the `index_shape` intrinsic.
+    /// The solving layer reports this with the ordinary `BadIndex` diagnostic category.
+    BadIndex { message: String },
+
     /// Operation not supported on variadic shapes.
     /// Triggers fixture fallback instead of a user-visible error.
     Unsupported { message: String },
@@ -1317,6 +1323,7 @@ impl Display for ShapeError {
                     got, max
                 )
             }
+            Self::BadIndex { message } => f.write_str(message),
             Self::Unsupported { message } => {
                 write!(f, "Unsupported: {}", message)
             }

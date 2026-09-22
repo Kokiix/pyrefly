@@ -16,6 +16,7 @@ use std::hash::Hasher;
 use std::io::Write;
 use std::iter::once;
 use std::num::NonZeroUsize;
+use std::path::MAIN_SEPARATOR;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use std::time::Instant;
 use crossbeam_channel::Sender;
 use dupe::Dupe;
 use dupe::OptionDupedExt;
+use glob::Pattern;
 use itertools::Itertools;
 use lsp_server::ErrorCode;
 use lsp_server::RequestId;
@@ -276,6 +278,7 @@ use crate::commands::config_finder::ConfigConfigurerWrapper;
 use crate::commands::lsp::IndexingMode;
 use crate::config::config::ConfigFile;
 use crate::config::config::ConfigScope;
+use crate::config::error_kind::ErrorKind;
 use crate::error::error::Error;
 use crate::lsp::module_helpers::to_real_path;
 use crate::lsp::non_wasm::build_system::should_requery_build_system;
@@ -312,7 +315,10 @@ use crate::lsp::non_wasm::queue::QueuedEvent;
 use crate::lsp::non_wasm::safe_delete_file::safe_delete_file_code_action;
 use crate::lsp::non_wasm::stdlib::should_show_stdlib_error;
 use crate::lsp::non_wasm::transaction_manager::TransactionManager;
+use crate::lsp::non_wasm::type_error_display_status::BuildSystemStatus;
 use crate::lsp::non_wasm::type_error_display_status::TypeErrorDisplayStatus;
+pub use crate::lsp::non_wasm::type_error_display_status::TypeErrorDisplayStatusChangedNotification;
+use crate::lsp::non_wasm::type_error_display_status::TypeErrorDisplayStatusChangedParams;
 pub use crate::lsp::non_wasm::type_error_display_status::TypeErrorDisplayStatusRequest;
 use crate::lsp::non_wasm::type_error_display_status::TypeErrorDisplayStatusResponse;
 use crate::lsp::non_wasm::type_error_display_status::TypeErrorDisplayStatusV2;
@@ -320,6 +326,7 @@ use crate::lsp::non_wasm::type_error_display_status::TypeErrorDisplayStatusVersi
 use crate::lsp::non_wasm::type_error_display_status::default_v2_response;
 use crate::lsp::non_wasm::type_error_display_status::derive_v2_response;
 use crate::lsp::non_wasm::type_error_display_status::negotiate_type_error_display_status_version;
+use crate::lsp::non_wasm::type_error_display_status::should_push_type_error_display_status;
 use crate::lsp::non_wasm::type_hierarchy::collect_class_defs;
 use crate::lsp::non_wasm::type_hierarchy::find_class_at_position_in_ast;
 use crate::lsp::non_wasm::type_hierarchy::prepare_type_hierarchy_item;
@@ -482,7 +489,14 @@ pub trait TspInterface: Send + Sync + 'static {
     ///
     /// Returns `None` when the URI cannot be resolved, the position is invalid,
     /// or no type information is available at that location.
-    fn type_at_position(&self, uri: &str, line: u32, character: u32) -> Option<tsp_types::Type>;
+    fn type_at_position<'a>(
+        &'a self,
+        ide_transaction_manager: &mut TransactionManager<'a>,
+        telemetry_event: &mut TelemetryEvent,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Option<tsp_types::Type>;
 
     /// Return the computed (inferred) type for a node spanning the given range,
     /// converted to the TSP wire format.
@@ -501,8 +515,10 @@ pub trait TspInterface: Send + Sync + 'static {
     /// declaration locations are resolved against the same warm transaction
     /// that produced the type, so the export lookups cannot hit a cold
     /// `get_stdlib`.
-    fn computed_type_at_range(
-        &self,
+    fn computed_type_at_range<'a>(
+        &'a self,
+        ide_transaction_manager: &mut TransactionManager<'a>,
+        telemetry_event: &mut TelemetryEvent,
         uri: &str,
         start_line: u32,
         start_character: u32,
@@ -514,8 +530,10 @@ pub trait TspInterface: Send + Sync + 'static {
     /// expected type — a call argument's parameter type, an annotated target's
     /// declared type, etc. — falling back to the computed type where no
     /// expected-type context applies.
-    fn expected_type_at_position(
-        &self,
+    fn expected_type_at_position<'a>(
+        &'a self,
+        ide_transaction_manager: &mut TransactionManager<'a>,
+        telemetry_event: &mut TelemetryEvent,
         uri: &str,
         line: u32,
         character: u32,
@@ -766,6 +784,14 @@ fn apply_markdown_to_document_report(report: &mut DocumentDiagnosticReport) {
     }
 }
 
+/// Convert an exact filesystem path into an LSP glob pattern that matches only that path.
+fn escape_glob_path(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace(MAIN_SEPARATOR, "/");
+    Pattern::escape(&normalized)
+        .replace('{', "[{]")
+        .replace('}', "[}]")
+}
+
 /// Escape markdown special characters in a diagnostic message, preserving
 /// backtick-delimited code spans. If backticks are unbalanced (odd count),
 /// all backticks are escaped as literals instead of being treated as code
@@ -798,14 +824,99 @@ fn format_diagnostic_message_for_markdown(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    use std::path::Path;
+    use std::path::PathBuf;
+
     use lsp_types::CodeActionKind;
+    use lsp_types::GlobPattern;
     use lsp_types::InitializeParams;
+    use pyrefly_util::events::CategorizedEvents;
+    use pyrefly_util::globs::Glob;
+    use pyrefly_util::interned_path::InternedPath;
+    use pyrefly_util::watch_pattern::WatchPattern;
     use serde_json::json;
+    use starlark_map::small_set::SmallSet;
 
     use super::SOURCE_FIX_ALL_PYREFLY;
+    use super::Server;
     use super::client_uses_custom_hover_provider;
+    use super::escape_glob_path;
     use super::format_diagnostic_message_for_markdown;
     use super::matches_fix_all_kind;
+
+    #[test]
+    fn test_exact_watch_pattern_serialization() {
+        let GlobPattern::String(escaped_pattern) = Server::get_pattern_to_watch(
+            WatchPattern::file(PathBuf::from("config[prod]?.py")),
+            false,
+        ) else {
+            panic!("Expected a string glob pattern");
+        };
+        assert_eq!(escaped_pattern, "config[[]prod[]][?].py");
+
+        let glob = Glob::new(escaped_pattern).unwrap();
+        assert!(glob.matches(Path::new("config[prod]?.py")));
+        assert!(!glob.matches(Path::new("configpa.py")));
+    }
+
+    #[test]
+    fn test_split_new_exact_paths_tracks_each_path_once() {
+        let exact_a = PathBuf::from("/configs/a.toml");
+        let exact_b = PathBuf::from("/configs/b.toml");
+        let root = InternedPath::from_path(Path::new("/workspace"));
+        let root_pattern = WatchPattern::root(root, "**/*.py".to_owned());
+
+        let mut registered = SmallSet::new();
+        let (roots, new_exact_paths) = Server::split_new_exact_paths(
+            [
+                WatchPattern::file(exact_b.clone()),
+                root_pattern.clone(),
+                WatchPattern::file(exact_a.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            &mut registered,
+        );
+        // Root patterns stay in the shared registration; each unseen exact path is
+        // returned once, in the order it was encountered.
+        assert_eq!(roots, SmallSet::from_iter([root_pattern]));
+        assert_eq!(new_exact_paths, vec![exact_b.clone(), exact_a.clone()]);
+
+        // Re-seeing a path is a no-op: it already has a permanent registration.
+        let (roots, new_exact_paths) = Server::split_new_exact_paths(
+            [WatchPattern::file(exact_a.clone())].into_iter().collect(),
+            &mut registered,
+        );
+        assert!(roots.is_empty());
+        assert!(new_exact_paths.is_empty());
+        assert_eq!(registered, SmallSet::from_iter([exact_b, exact_a]));
+
+        // Each exact registration gets a fresh, uniquely-identified ID.
+        let first_id = Server::next_exact_file_watcher_id();
+        let second_id = Server::next_exact_file_watcher_id();
+        assert!(first_id.starts_with(Server::EXACT_FILEWATCHER_ID_PREFIX));
+        assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn test_escape_glob_path() {
+        assert_eq!(
+            escape_glob_path(&Path::new("dir").join("config[*?{}].toml")),
+            "dir/config[[][*][?][{][}][]].toml"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_escape_glob_path_with_literal_backslash() {
+        let path = Path::new(r"dir\config[*?{}].toml");
+        let escaped = escape_glob_path(path);
+        assert_eq!(escaped, r"dir\config[[][*][?][{][}][]].toml");
+
+        let glob = Glob::new(escaped).unwrap();
+        assert!(glob.matches(path));
+    }
 
     #[test]
     fn test_format_diagnostic_message_for_markdown() {
@@ -876,6 +987,78 @@ mod tests {
         }));
         assert!(client_uses_custom_hover_provider(&params));
     }
+
+    #[test]
+    fn test_should_rewatch() {
+        let explicit_config = PathBuf::from("/workspace/project.settings");
+        let explicit_config_paths = SmallSet::from_iter([explicit_config.clone()]);
+        let cases = [
+            (
+                "dependency metadata",
+                CategorizedEvents {
+                    modified: vec![PathBuf::from("uv.lock")],
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "configuration metadata",
+                CategorizedEvents {
+                    modified: vec![PathBuf::from("pyrefly.toml")],
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "created source",
+                CategorizedEvents {
+                    created: vec![PathBuf::from("module.py")],
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "removed source",
+                CategorizedEvents {
+                    removed: vec![PathBuf::from("module.py")],
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "modified source",
+                CategorizedEvents {
+                    modified: vec![PathBuf::from("module.py")],
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "explicit config path",
+                CategorizedEvents {
+                    modified: vec![explicit_config],
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "stale explicit config path",
+                CategorizedEvents {
+                    modified: vec![PathBuf::from("/workspace/previous.settings")],
+                    ..Default::default()
+                },
+                false,
+            ),
+        ];
+
+        for (name, events, expected) in cases {
+            assert_eq!(
+                Server::should_rewatch(&events, &explicit_config_paths),
+                expected,
+                "{name}"
+            );
+        }
+    }
 }
 
 pub struct Server {
@@ -886,6 +1069,9 @@ pub struct Server {
     sourcedb_queue: HeavyTaskQueue,
     /// Any configs whose find cache should be invalidated.
     invalidated_source_dbs: Mutex<SmallSet<ArcId<Box<dyn SourceDatabase + 'static>>>>,
+    /// State of the most recent build-system source database query, surfaced in
+    /// the status bar.
+    build_system_status: Mutex<Option<BuildSystemStatus>>,
     /// Custom initialization options are provided via initialize_params.initializationOptions
     /// The type should match `LspConfig`
     initialize_params: InitializeParams,
@@ -931,6 +1117,9 @@ pub struct Server {
     next_progress_token_id: AtomicUsize,
     filewatcher_registered: AtomicBool,
     watched_patterns: Mutex<SmallSet<WatchPattern>>,
+    /// Exact file paths that already have a dedicated, permanent watcher registration.
+    /// These registrations are additive and never removed, so this set only grows.
+    watched_exact_paths: Mutex<SmallSet<PathBuf>>,
     version_info: Mutex<HashMap<PathBuf, i32>>,
     id: Uuid,
     /// The surface/entrypoint for the language server (`--from` CLI arg)
@@ -967,6 +1156,10 @@ pub struct Server {
     /// [`TypeErrorDisplayStatusVersion::LATEST`] (the richest shape this
     /// server knows about) and a missing field to `V1`.
     type_error_display_status_version: TypeErrorDisplayStatusVersion,
+    /// Whether the client declared, via
+    /// `initializationOptions.pyrefly.pushTypeErrorDisplayStatus`, that it
+    /// handles [`TypeErrorDisplayStatusChangedNotification`].
+    push_type_error_display_status: bool,
     /// Testing-only flag to prevent the next recheck from committing.
     /// When set, the recheck queue task will loop without committing the transaction.
     do_not_commit_recheck: AtomicBool,
@@ -1583,8 +1776,15 @@ impl From<HandleError> for EmptyResponseReason {
     }
 }
 
+/// Upper bound on the symbols returned for one query. Fuzzy matching is
+/// subsequence-based, so a short query like `init` matches a large fraction of
+/// a project's methods. Local matches are ranked and take priority. Unscored
+/// external matches fill any remaining capacity in provider order.
+const MAX_WORKSPACE_SYMBOLS: usize = 1000;
+
 impl Server {
     const FILEWATCHER_ID: &str = "FILEWATCHER";
+    const EXACT_FILEWATCHER_ID_PREFIX: &str = "FILEWATCHER-EXACT-";
 
     fn clear_published_workspace_diagnostics(&self) {
         self.published_workspace_diagnostics.lock().clear();
@@ -2675,6 +2875,9 @@ impl Server {
         let type_error_display_status_version = negotiate_type_error_display_status_version(
             initialize_params.initialization_options.as_ref(),
         );
+        let push_type_error_display_status = should_push_type_error_display_status(
+            initialize_params.initialization_options.as_ref(),
+        );
 
         let should_request_workspace_settings = initialize_params
             .capabilities
@@ -2689,6 +2892,7 @@ impl Server {
             find_reference_queue: HeavyTaskQueue::new(QueueName::FindReferenceQueue),
             sourcedb_queue: HeavyTaskQueue::new(QueueName::SourceDbQueue),
             invalidated_source_dbs: Mutex::new(SmallSet::new()),
+            build_system_status: Mutex::new(None),
             initialize_params,
             indexing_mode,
             workspace_indexing_limit,
@@ -2713,6 +2917,7 @@ impl Server {
             next_progress_token_id: AtomicUsize::new(1),
             filewatcher_registered: AtomicBool::new(false),
             watched_patterns: Mutex::new(SmallSet::new()),
+            watched_exact_paths: Mutex::new(SmallSet::new()),
             version_info: Mutex::new(HashMap::new()),
             id: Uuid::new_v4(),
             surface,
@@ -2722,6 +2927,7 @@ impl Server {
             currently_streaming_diagnostics_for_handles: RwLock::new(None),
             diagnostic_markdown_support,
             type_error_display_status_version,
+            push_type_error_display_status,
             do_not_commit_recheck: AtomicBool::new(false),
             // Will be set to true if we send a workspace/configuration request
             awaiting_initial_workspace_config: AtomicBool::new(should_request_workspace_settings),
@@ -3035,6 +3241,10 @@ impl Server {
             workspace_disable_type_errors,
             workspace_type_checking_mode,
             self.server_version.clone(),
+            self.build_system_status
+                .lock()
+                .as_ref()
+                .map(BuildSystemStatus::display),
         )
     }
 
@@ -3065,13 +3275,13 @@ impl Server {
             .unwrap_or(false)
     }
 
-    /// Helper to append all additional diagnostics (unreachable, unused parameters/imports/variables)
+    /// Helper to append unreachable-code, unused parameter, import, and variable diagnostics.
     fn append_ide_specific_diagnostics(
         transaction: &Transaction<'_>,
         handle: &Handle,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
-        Self::append_unreachable_diagnostics(transaction, handle, diagnostics);
+        Self::append_unreachable_hints(transaction, handle, diagnostics);
         Self::append_unused_parameter_diagnostics(transaction, handle, diagnostics);
         Self::append_unused_import_diagnostics(transaction, handle, diagnostics);
         Self::append_unused_variable_diagnostics(transaction, handle, diagnostics);
@@ -3236,6 +3446,7 @@ impl Server {
         self.invalidate(
             TelemetryEventKind::InvalidateFind,
             Some(TelemetryInvalidateFindReason::SourceDbConfigChanged),
+            false,
             |t| t.invalidate_find_for_configs(invalidated_configs),
         );
     }
@@ -3327,10 +3538,88 @@ impl Server {
         }
     }
 
+    fn invalidate_queue(
+        server: &Server,
+        telemetry_event: &mut TelemetryEvent,
+        open_handles: Vec<Handle>,
+        f: Option<impl FnOnce(&mut Transaction) + Send + Sync + 'static>,
+    ) {
+        // Filter to only include handles from workspaces with streaming enabled
+        let streaming_handles: SmallSet<Handle> = open_handles
+            .iter()
+            .filter(|h| {
+                server
+                    .workspaces
+                    .should_stream_diagnostics(h.path().as_path())
+            })
+            .cloned()
+            .collect();
+        // Store the snapshot so non-committable transactions know not to publish
+        // diagnostics for these files (they'll be streamed by this transaction)
+        let has_streaming = !streaming_handles.is_empty();
+        if has_streaming {
+            *server.currently_streaming_diagnostics_for_handles.write() =
+                Some(streaming_handles.clone());
+        }
+        let publish_callback =
+            move |transaction: &Transaction<'_>, handle: &Handle, changed: bool| {
+                if changed && streaming_handles.contains(handle) {
+                    server.publish_for_handles(
+                        transaction,
+                        std::slice::from_ref(handle),
+                        DiagnosticSource::Streaming,
+                    )
+                }
+            };
+        let subscriber = server.make_recheck_subscriber(publish_callback);
+        let mut transaction = server
+            .state
+            .new_committable_transaction(Require::Exports, Some(subscriber));
+        let invalidate_start = Instant::now();
+        let has_f = f.is_some();
+        if let Some(i) = f {
+            // Mark files as dirty
+            i(transaction.as_mut());
+        } else {
+            transaction.as_mut().invalidate_config();
+        }
+
+        telemetry_event.set_invalidate_duration(invalidate_start.elapsed());
+
+        // Run transaction prioritizing currently-open files, sending diagnostics as soon as they are available via the subscriber
+        server.validate_in_memory_for_transaction(transaction.as_mut(), telemetry_event, None);
+
+        if has_f {
+            // Wait in a loop while do_not_commit_recheck flag is set (testing only)
+            while server.do_not_commit_recheck.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        // Commit will be blocked until there are no ongoing reads.
+        // If we have some long running read jobs that can be cancelled, we should cancel them
+        // to unblock committing transactions.
+        for (_, cancellation_handle) in server.cancellation_handles.lock().drain() {
+            cancellation_handle.cancel();
+        }
+
+        // we have to run, not just commit to process updates
+        server.state.run_with_committing_transaction(
+            transaction,
+            &[],
+            Require::Everything,
+            Some(telemetry_event),
+            None,
+        );
+
+        *server.currently_streaming_diagnostics_for_handles.write() = None;
+    }
+
     fn invalidate(
         &self,
         kind: TelemetryEventKind,
         invalidate_find_reason: Option<TelemetryInvalidateFindReason>,
+        rewatch: bool,
         f: impl FnOnce(&mut Transaction) + Send + Sync + 'static,
     ) {
         let open_handles = self.get_open_file_handles();
@@ -3340,69 +3629,13 @@ impl Server {
                 if let Some(reason) = invalidate_find_reason {
                     telemetry_event.set_invalidate_find_reason(reason);
                 }
-                // Filter to only include handles from workspaces with streaming enabled
-                let streaming_handles: SmallSet<Handle> = open_handles
-                    .iter()
-                    .filter(|h| {
-                        server
-                            .workspaces
-                            .should_stream_diagnostics(h.path().as_path())
-                    })
-                    .cloned()
-                    .collect();
-                // Store the snapshot so non-committable transactions know not to publish
-                // diagnostics for these files (they'll be streamed by this transaction)
-                let has_streaming = !streaming_handles.is_empty();
-                if has_streaming {
-                    *server.currently_streaming_diagnostics_for_handles.write() =
-                        Some(streaming_handles.clone());
-                }
-                let publish_callback =
-                    move |transaction: &Transaction<'_>, handle: &Handle, changed: bool| {
-                        if changed && streaming_handles.contains(handle) {
-                            server.publish_for_handles(
-                                transaction,
-                                std::slice::from_ref(handle),
-                                DiagnosticSource::Streaming,
-                            )
-                        }
-                    };
-                let subscriber = server.make_recheck_subscriber(publish_callback);
-                let mut transaction = server
-                    .state
-                    .new_committable_transaction(Require::Exports, Some(subscriber));
-                let invalidate_start = Instant::now();
-                // Mark files as dirty
-                f(transaction.as_mut());
-                telemetry_event.set_invalidate_duration(invalidate_start.elapsed());
 
-                // Run transaction prioritizing currently-open files, sending diagnostics as soon as they are available via the subscriber
-                server.validate_in_memory_for_transaction(
-                    transaction.as_mut(),
-                    telemetry_event,
-                    None,
-                );
+                Self::invalidate_queue(server, telemetry_event, open_handles, Some(f));
 
-                // Wait in a loop while do_not_commit_recheck flag is set (testing only)
-                while server.do_not_commit_recheck.load(Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                if rewatch {
+                    info!("[Pyrefly] Re-registering file watchers");
+                    server.setup_file_watcher_if_necessary(Some(telemetry_event));
                 }
-
-                // Commit will be blocked until there are no ongoing reads.
-                // If we have some long running read jobs that can be cancelled, we should cancel them
-                // to unblock committing transactions.
-                for (_, cancellation_handle) in server.cancellation_handles.lock().drain() {
-                    cancellation_handle.cancel();
-                }
-                // we have to run, not just commit to process updates
-                server.state.run_with_committing_transaction(
-                    transaction,
-                    &[],
-                    Require::Everything,
-                    Some(telemetry_event),
-                    None,
-                );
-                *server.currently_streaming_diagnostics_for_handles.write() = None;
 
                 // After we finished a recheck asynchronously, we immediately send `RecheckFinished` to
                 // the main event loop of the server. As a result, the server can do a revalidation of
@@ -3588,6 +3821,28 @@ impl Server {
         !self.workspaces.workspace_diagnostic_roots().is_empty()
     }
 
+    /// Records the build system's state and, for clients that opted in, tells
+    /// them their cached status-bar payload is stale.
+    ///
+    /// Called from the source database queue thread, so it must not take any
+    /// lock the query itself holds.
+    fn set_build_system_status(&self, status: BuildSystemStatus) {
+        *self.build_system_status.lock() = Some(status);
+        // Every shape but V1 carries `buildSystem`, so a client on one can act on the
+        // notification. Spelling this as "not V1" rather than "is V2" keeps it correct
+        // when a V3 is added.
+        if self.push_type_error_display_status
+            && self.type_error_display_status_version != TypeErrorDisplayStatusVersion::V1
+        {
+            self.connection
+                .send(Message::Notification(new_notification::<
+                    TypeErrorDisplayStatusChangedNotification,
+                >(
+                    TypeErrorDisplayStatusChangedParams {},
+                )));
+        }
+    }
+
     /// Attempts to requery any open sourced_dbs for open files, and if there are changes,
     /// invalidate find and perform a recheck.
     fn queue_source_db_rebuild_and_recheck(
@@ -3616,12 +3871,29 @@ impl Server {
                     .insert(handle.path().dupe());
             }
             let task_telemetry = SubTaskTelemetry::new(telemetry, telemetry_event);
-            let (new_invalidated_source_dbs, rebuild_stats) =
+            // Mirrors the filter in `ConfigFile::query_source_db` to see if we
+            // will actually kick a build system query off.
+            let queries_build_system = configs_to_paths.keys().any(|config| {
+                config
+                    .source_db
+                    .as_ref()
+                    .is_some_and(|db| db.as_live_source_database().is_some())
+            });
+            if queries_build_system {
+                server.set_build_system_status(BuildSystemStatus::Building);
+            }
+            let outcome =
                 ConfigFile::query_source_db(&configs_to_paths, force, Some(task_telemetry));
-            telemetry_event.set_sourcedb_rebuild_stats(rebuild_stats);
-            if !new_invalidated_source_dbs.is_empty() {
+            if queries_build_system {
+                server.set_build_system_status(match outcome.error {
+                    Some(error) => BuildSystemStatus::Failed(error),
+                    None => BuildSystemStatus::Ready,
+                });
+            }
+            telemetry_event.set_sourcedb_rebuild_stats(outcome.stats);
+            if !outcome.reloaded.is_empty() {
                 let mut lock = server.invalidated_source_dbs.lock();
-                for db in new_invalidated_source_dbs {
+                for db in outcome.reloaded {
                     lock.insert(db);
                 }
                 let _ = server.lsp_queue.send(LspEvent::InvalidateConfigFind);
@@ -3638,7 +3910,7 @@ impl Server {
 
     fn did_save(&self, url: Url) {
         if let Some(path) = self.path_for_uri(&url) {
-            self.invalidate(TelemetryEventKind::InvalidateDisk, None, move |t| {
+            self.invalidate(TelemetryEventKind::InvalidateDisk, None, false, move |t| {
                 t.invalidate_disk(&[path])
             })
         }
@@ -3924,22 +4196,15 @@ impl Server {
         Ok(())
     }
 
-    /// Determines whether file watchers should be re-registered based on event types.
-    /// Returns true if config files changed or files were created/removed/unknown.
-    fn should_rewatch(events: &CategorizedEvents) -> bool {
-        let config_changed = events.iter().any(|x| {
-            x.file_name()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| ConfigFile::CONFIG_FILE_NAMES.contains(&x))
-        });
-
-        // Re-register watchers if files were created/removed (pip install, new files, etc.)
-        // or if unknown events occurred. This ensures we discover new files while avoiding
-        // unnecessary re-registration on simple file modifications.
-        let files_added_or_removed =
-            !events.created.is_empty() || !events.removed.is_empty() || !events.unknown.is_empty();
-
-        config_changed || files_added_or_removed
+    fn should_rewatch(
+        events: &CategorizedEvents,
+        explicit_config_paths: &SmallSet<PathBuf>,
+    ) -> bool {
+        events.iter().any(|path| {
+            ConfigFile::is_watched_metadata(path) || explicit_config_paths.contains(path)
+        }) || !events.created.is_empty()
+            || !events.removed.is_empty()
+            || !events.unknown.is_empty()
     }
 
     fn did_change_watched_files(
@@ -3981,11 +4246,7 @@ impl Server {
 
         let should_requery_build_system = should_requery_build_system(&events);
 
-        // Rewatch files if necessary (config changed, files added/removed, etc.)
-        if Self::should_rewatch(&events) {
-            info!("[Pyrefly] Re-registering file watchers");
-            self.setup_file_watcher_if_necessary(Some(telemetry_event));
-        }
+        let rewatch = Self::should_rewatch(&events, &self.workspaces.explicit_config_paths());
 
         // Accumulate events in the pending buffer. The heavy task drains this
         // buffer at execution time, so consecutive DrainWatchedFileChanges events
@@ -3993,12 +4254,22 @@ impl Server {
         // and subsequent tasks find an empty buffer and become no-ops.
         self.pending_invalidation_events.lock().extend(events);
         let pending = Arc::clone(&self.pending_invalidation_events);
+        let workspaces = Arc::clone(&self.workspaces);
         self.invalidate(
             TelemetryEventKind::InvalidateFind,
             Some(TelemetryInvalidateFindReason::WatcherEvents),
+            rewatch,
             move |t| {
                 let events = std::mem::take(&mut *pending.lock());
                 if !events.is_empty() {
+                    // Exact registrations are monotonic, so stale path events can still arrive.
+                    let explicit_config_paths = workspaces.explicit_config_paths();
+                    if events
+                        .iter()
+                        .any(|path| explicit_config_paths.contains(path))
+                    {
+                        t.invalidate_config();
+                    }
                     t.invalidate_events(&events);
                 }
             },
@@ -4151,6 +4422,7 @@ impl Server {
         }
 
         if modified {
+            self.setup_file_watcher_if_necessary(None);
             self.invalidate_config_and_validate_in_memory();
         }
     }
@@ -4183,6 +4455,7 @@ impl Server {
         }
 
         if modified {
+            self.setup_file_watcher_if_necessary(Some(telemetry_event));
             self.invalidate_config_and_validate_in_memory();
         }
 
@@ -5457,7 +5730,7 @@ impl Server {
                             location,
                             tags: None,
                             deprecated: None,
-                            container_name: None,
+                            container_name: symbol.container_name,
                         })
                 })
                 .collect();
@@ -5468,50 +5741,74 @@ impl Server {
 
         let external_results = external_results.transpose()?.unwrap_or_default();
 
-        // Local results take priority; skip external results for files already covered.
+        // Local results are ranked and take priority. External results have no
+        // comparable score, so they fill only the remaining capacity. Coverage
+        // uses the full local set, so its truncation cannot let a duplicate in.
         let local_uris: HashSet<Url> = local_results
             .iter()
             .map(|s| s.location.uri.clone())
             .collect();
         let mut merged = local_results;
-        for sym in external_results {
-            if !local_uris.contains(&sym.location.uri) {
-                merged.push(sym);
-            }
-        }
+        merged.truncate(MAX_WORKSPACE_SYMBOLS);
+        let remaining = MAX_WORKSPACE_SYMBOLS - merged.len();
+        merged.extend(
+            external_results
+                .into_iter()
+                .filter(|sym| !local_uris.contains(&sym.location.uri))
+                .take(remaining),
+        );
         Ok(merged)
     }
 
-    fn append_unreachable_diagnostics(
+    /// Grey out code that is disabled by the current configuration but carries no
+    /// `unreachable` diagnostic of its own.
+    ///
+    /// Editors dim a region when a diagnostic covering it is tagged `UNNECESSARY`, so a
+    /// suite we deliberately do not report — one guarded by `sys.version_info`,
+    /// `sys.platform`, `os.name`, or `TYPE_CHECKING` — would otherwise lose its dimming.
+    /// Suites the real diagnostic does cover are skipped, since it carries the tag itself.
+    fn append_unreachable_hints(
         transaction: &Transaction<'_>,
         handle: &Handle,
         items: &mut Vec<Diagnostic>,
     ) {
-        if let (Some(ast), Some(module_info)) = (
+        let (Some(ast), Some(module_info)) = (
             transaction.get_ast(handle),
             transaction.get_module_info(handle),
-        ) {
-            let disabled_ranges = disabled_ranges_for_module(ast.as_ref(), *handle.sys_info());
-            let mut seen = HashSet::new();
-            for range in disabled_ranges {
-                if range.is_empty() || !seen.insert(range) {
-                    continue;
-                }
-                let lsp_range = module_info.to_lsp_range(range);
-                items.push(Diagnostic {
-                    range: lsp_range,
-                    severity: Some(DiagnosticSeverity::HINT),
-                    source: Some("Pyrefly".to_owned()),
-                    message: "This code is unreachable for the current configuration"
-                        .to_owned()
-                        .into(),
-                    code: Some(NumberOrString::String("unreachable-code".to_owned())),
-                    code_description: None,
-                    related_information: None,
-                    tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                    data: None,
-                });
+        ) else {
+            return;
+        };
+        let unreachable_code = NumberOrString::String(ErrorKind::Unreachable.to_name().to_owned());
+        let already_reported = items
+            .iter()
+            .filter(|d| d.code.as_ref() == Some(&unreachable_code))
+            .map(|d| d.range)
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        for range in disabled_ranges_for_module(ast.as_ref(), *handle.sys_info()) {
+            if range.is_empty() || !seen.insert(range) {
+                continue;
             }
+            let lsp_range = module_info.to_lsp_range(range);
+            if already_reported
+                .iter()
+                .any(|r| r.start <= lsp_range.start && lsp_range.end <= r.end)
+            {
+                continue;
+            }
+            items.push(Diagnostic {
+                range: lsp_range,
+                severity: Some(DiagnosticSeverity::HINT),
+                source: Some("Pyrefly".to_owned()),
+                message: "This code is unreachable for the current configuration"
+                    .to_owned()
+                    .into(),
+                code: Some(NumberOrString::String("unreachable-code".to_owned())),
+                code_description: None,
+                related_information: None,
+                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                data: None,
+            });
         }
     }
 
@@ -5520,7 +5817,8 @@ impl Server {
         handle: &Handle,
         items: &mut Vec<Diagnostic>,
     ) {
-        if let Some(bindings) = transaction.get_bindings(handle) {
+        if let Some(answers) = transaction.get_answers(handle) {
+            let bindings = answers.bindings();
             let module_info = bindings.module();
             for unused in bindings.unused_parameters() {
                 if Ast::is_intentionally_unused(unused.name.as_str()) {
@@ -5547,7 +5845,8 @@ impl Server {
         handle: &Handle,
         items: &mut Vec<Diagnostic>,
     ) {
-        if let Some(bindings) = transaction.get_bindings(handle) {
+        if let Some(answers) = transaction.get_answers(handle) {
+            let bindings = answers.bindings();
             let module_info = bindings.module();
             for unused in bindings.unused_imports() {
                 let lsp_range = module_info.to_lsp_range(unused.range);
@@ -5571,7 +5870,8 @@ impl Server {
         handle: &Handle,
         items: &mut Vec<Diagnostic>,
     ) {
-        if let Some(bindings) = transaction.get_bindings(handle) {
+        if let Some(answers) = transaction.get_answers(handle) {
+            let bindings = answers.bindings();
             let module_info = bindings.module();
             for unused in bindings.unused_variables() {
                 if Ast::is_intentionally_unused(unused.name.as_str()) {
@@ -5788,7 +6088,7 @@ impl Server {
     /// by VSCode, provided its `relative_pattern_support`.
     fn get_pattern_to_watch(pattern: WatchPattern, relative_pattern_support: bool) -> GlobPattern {
         match pattern {
-            WatchPattern::File(root) => GlobPattern::String(root.to_string_lossy().into_owned()),
+            WatchPattern::File(root) => GlobPattern::String(escape_glob_path(&root)),
             WatchPattern::Root(root, pattern)
                 if relative_pattern_support && let Ok(url) = Url::from_directory_path(&**root) =>
             {
@@ -5801,6 +6101,38 @@ impl Server {
                 GlobPattern::String(root.join(pattern).to_string_lossy().into_owned())
             }
         }
+    }
+
+    /// A fresh registration ID for an exact file-path watcher. Each exact path is
+    /// registered under its own ID so it can be added independently and is never
+    /// unregistered.
+    fn next_exact_file_watcher_id() -> String {
+        format!("{}{}", Self::EXACT_FILEWATCHER_ID_PREFIX, Uuid::new_v4())
+    }
+
+    /// Split `patterns` into the root patterns that share the persistent
+    /// [`Self::FILEWATCHER_ID`] registration and the exact file paths that have not yet
+    /// been registered. Newly seen paths are recorded in `registered_exact_paths`, so each
+    /// exact path is watched exactly once and its registration is never replaced.
+    fn split_new_exact_paths(
+        patterns: SmallSet<WatchPattern>,
+        registered_exact_paths: &mut SmallSet<PathBuf>,
+    ) -> (SmallSet<WatchPattern>, Vec<PathBuf>) {
+        let mut root_patterns = SmallSet::new();
+        let mut new_exact_paths = Vec::new();
+        for pattern in patterns {
+            match pattern {
+                WatchPattern::File(path) => {
+                    if registered_exact_paths.insert(path.clone()) {
+                        new_exact_paths.push(path);
+                    }
+                }
+                WatchPattern::Root(..) => {
+                    root_patterns.insert(pattern);
+                }
+            }
+        }
+        (root_patterns, new_exact_paths)
     }
 
     fn setup_file_watcher_if_necessary(&self, telemetry_event: Option<&mut TelemetryEvent>) {
@@ -5826,11 +6158,23 @@ impl Server {
                         glob_patterns
                             .insert(WatchPattern::root(root.dupe(), format!("**/*.{suffix}")));
                     });
-                    ConfigFile::CONFIG_FILE_NAMES.iter().for_each(|config| {
-                        glob_patterns.insert(WatchPattern::root(root, format!("**/{config}")));
-                    });
+                    glob_patterns.extend(ConfigFile::metadata_watch_patterns(root));
                 }
+                glob_patterns.extend(
+                    self.workspaces
+                        .explicit_config_paths()
+                        .into_iter()
+                        .map(WatchPattern::file),
+                );
                 glob_patterns.extend(ConfigFile::get_paths_to_watch(&configs));
+
+                // Exact file paths get their own permanent registrations, so keep them out
+                // of the shared root registration and register each unseen path only once.
+                let (glob_patterns, new_exact_paths) = {
+                    let mut watched_exact_paths = self.watched_exact_paths.lock();
+                    Self::split_new_exact_paths(glob_patterns, &mut watched_exact_paths)
+                };
+
                 let mut watched_patterns = self.watched_patterns.lock();
 
                 let should_rewatch = watched_patterns.difference(&glob_patterns).next().is_some();
@@ -5860,27 +6204,56 @@ impl Server {
                     .collect::<Vec<_>>();
 
                 pattern_count = watchers.len();
-                if self.filewatcher_registered.load(Ordering::Relaxed) && should_rewatch {
-                    self.send_request::<UnregisterCapability>(UnregistrationParams {
-                        unregisterations: Vec::from([Unregistration {
+                // Reloading config re-runs this setup on every config change. Skip the root
+                // registration when it would be a no-op (no new patterns and no rewatch) so we
+                // don't churn the client with redundant, empty re-registrations.
+                let already_registered = self.filewatcher_registered.load(Ordering::Relaxed);
+                if !watchers.is_empty() || should_rewatch || !already_registered {
+                    if already_registered && should_rewatch {
+                        self.send_request::<UnregisterCapability>(UnregistrationParams {
+                            unregisterations: Vec::from([Unregistration {
+                                id: Self::FILEWATCHER_ID.to_owned(),
+                                method: DidChangeWatchedFiles::METHOD.to_owned(),
+                            }]),
+                        });
+                    }
+                    self.send_request::<RegisterCapability>(RegistrationParams {
+                        registrations: Vec::from([Registration {
                             id: Self::FILEWATCHER_ID.to_owned(),
                             method: DidChangeWatchedFiles::METHOD.to_owned(),
+                            register_options: Some(
+                                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                                    watchers,
+                                })
+                                .unwrap(),
+                            ),
+                        }]),
+                    });
+                    self.filewatcher_registered.store(true, Ordering::Relaxed);
+                }
+
+                for path in new_exact_paths {
+                    let watcher = FileSystemWatcher {
+                        glob_pattern: Self::get_pattern_to_watch(
+                            WatchPattern::File(path),
+                            relative_pattern_support,
+                        ),
+                        kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+                    };
+                    pattern_count += 1;
+                    self.send_request::<RegisterCapability>(RegistrationParams {
+                        registrations: Vec::from([Registration {
+                            id: Self::next_exact_file_watcher_id(),
+                            method: DidChangeWatchedFiles::METHOD.to_owned(),
+                            register_options: Some(
+                                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                                    watchers: Vec::from([watcher]),
+                                })
+                                .unwrap(),
+                            ),
                         }]),
                     });
                 }
-                self.send_request::<RegisterCapability>(RegistrationParams {
-                    registrations: Vec::from([Registration {
-                        id: Self::FILEWATCHER_ID.to_owned(),
-                        method: DidChangeWatchedFiles::METHOD.to_owned(),
-                        register_options: Some(
-                            serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
-                                watchers,
-                            })
-                            .unwrap(),
-                        ),
-                    }]),
-                });
-                self.filewatcher_registered.store(true, Ordering::Relaxed);
             }
             _ => (),
         }
@@ -5927,57 +6300,13 @@ impl Server {
             TelemetryEventKind::InvalidateConfig,
             Box::new(move |server, _telemetry, telemetry_event| {
                 // Filter to only include handles from workspaces with streaming enabled
-                let streaming_handles: SmallSet<Handle> = open_handles
-                    .iter()
-                    .filter(|h| {
-                        server
-                            .workspaces
-                            .should_stream_diagnostics(h.path().as_path())
-                    })
-                    .cloned()
-                    .collect();
-                let has_streaming = !streaming_handles.is_empty();
-                if has_streaming {
-                    *server.currently_streaming_diagnostics_for_handles.write() =
-                        Some(streaming_handles.clone());
-                }
-                let publish_callback =
-                    move |transaction: &Transaction<'_>, handle: &Handle, changed: bool| {
-                        if changed && streaming_handles.contains(handle) {
-                            server.publish_for_handles(
-                                transaction,
-                                std::slice::from_ref(handle),
-                                DiagnosticSource::Streaming,
-                            )
-                        }
-                    };
-                let subscriber = server.make_recheck_subscriber(publish_callback);
-                let mut transaction = server
-                    .state
-                    .new_committable_transaction(Require::Exports, Some(subscriber));
-                let invalidate_start = Instant::now();
-                transaction.as_mut().invalidate_config();
-                telemetry_event.set_invalidate_duration(invalidate_start.elapsed());
-                server.validate_in_memory_for_transaction(
-                    transaction.as_mut(),
+                Self::invalidate_queue(
+                    server,
                     telemetry_event,
-                    None,
+                    open_handles,
+                    None::<fn(&mut Transaction)>,
                 );
-                // Commit will be blocked until there are no ongoing reads.
-                // If we have some long running read jobs that can be cancelled, we should cancel them
-                // to unblock committing transactions.
-                for (_, cancellation_handle) in server.cancellation_handles.lock().drain() {
-                    cancellation_handle.cancel();
-                }
-                // we have to run, not just commit to process updates
-                server.state.run_with_committing_transaction(
-                    transaction,
-                    &[],
-                    Require::Everything,
-                    Some(telemetry_event),
-                    None,
-                );
-                *server.currently_streaming_diagnostics_for_handles.write() = None;
+
                 // After we finished a recheck asynchronously, we immediately send `RecheckFinished` to
                 // the main event loop of the server. As a result, the server can do a revalidation of
                 // all the in-memory files based on the fresh main State as soon as possible.
@@ -6251,7 +6580,8 @@ impl Server {
     ) -> Option<TypeHierarchyTarget> {
         let ast = transaction.as_ref().get_ast(handle)?;
         let class_def = find_class_at_position_in_ast(&ast, definition.definition_range.start())?;
-        let bindings = transaction.as_ref().get_bindings(handle)?;
+        let answers = transaction.as_ref().get_answers(handle)?;
+        let bindings = answers.bindings();
         let def_index = bindings.class_def_index(class_def)?;
         Some(TypeHierarchyTarget {
             def_index,
@@ -6301,9 +6631,10 @@ impl Server {
             let Some(solutions) = transaction.as_ref().get_solutions(&candidate) else {
                 continue;
             };
-            let Some(bindings) = transaction.as_ref().get_bindings(&candidate) else {
+            let Some(answers) = transaction.as_ref().get_answers(&candidate) else {
                 continue;
             };
+            let bindings = answers.bindings();
             let Some(module_info) = transaction.as_ref().get_module_info(&candidate) else {
                 continue;
             };
@@ -6507,64 +6838,81 @@ impl Server {
         )
     }
 
-    /// Build a read transaction and the handle the type checker analyzes `path`
-    /// under, so `(uri, range)` queries resolve for any analyzable file rather
-    /// than only open documents.
+    /// Run `query` in a read-only transaction where `uri` is analyzed, then
+    /// save the transaction for the next IDE request.
     ///
-    /// Open files are served from their in-memory overlay (already committed by
-    /// the recheck that ran on `didOpen`). For anything else we reuse the handle
-    /// the file was already analyzed under — an imported dependency's filesystem
-    /// handle, or a bundled stdlib stub's `BundledTypeshed` handle whose
-    /// `SysInfo` we can't reconstruct here, hence the by-path lookup — and force
-    /// a full solve (`Require::Everything` is the only level that retains
-    /// bindings/answers, which the type lookup reads) so narrowed/computed types
-    /// are available. A file that isn't analyzed yet falls back to a fresh
-    /// filesystem handle read from disk.
-    fn query_transaction_and_handle<'a>(&'a self, path: &Path) -> (Transaction<'a>, Handle) {
-        if self.open_files.read().contains_key(path) {
-            return (
-                self.state.transaction(),
-                make_open_handle(&self.state, path),
-            );
-        }
-        let mut transaction = self.state.transaction();
-        // Imported dependencies live under a filesystem handle we can rebuild
-        // directly; only scan when that misses (bundled stubs, unusual SysInfo).
-        let fs_handle =
-            handle_from_module_path(&self.state, ModulePath::filesystem(path.to_owned()));
-        let handle = if transaction.get_module_info(&fs_handle).is_some() {
-            fs_handle
-        } else {
-            transaction
-                .handles()
-                .into_iter()
-                .find(|h| !h.path().is_memory() && to_real_path(h.path()).as_deref() == Some(path))
-                .unwrap_or(fs_handle)
-        };
-        transaction.run(&[handle.dupe()], Require::Everything, None);
-        (transaction, handle)
-    }
-
-    /// Open `uri` at `(line, character)`: resolve the path, build a handle, and
-    /// start a transaction, returning it alongside the handle and the resolved
-    /// in-file position.
-    fn open_at_position<'a>(
+    /// A file the client never opened may not be retained at
+    /// `Require::Everything` yet. When it isn't we solve it in a committable
+    /// transaction and commit before answering: raising a module's `Require`
+    /// dirties it, so the solve rebuilds the module and its dependencies from
+    /// scratch, and discarding it would repeat that for every query against
+    /// the same file.
+    fn with_query_transaction<'a, T>(
         &'a self,
+        ide_transaction_manager: &mut TransactionManager<'a>,
+        telemetry_event: &mut TelemetryEvent,
         uri: &str,
-        line: u32,
-        character: u32,
-    ) -> Option<(Transaction<'a>, Handle, TextSize)> {
+        query: impl FnOnce(&Transaction<'a>, &Handle, Option<usize>) -> Option<T>,
+    ) -> Option<T> {
         let url = Url::parse(uri)
             .ok()
             .or_else(|| Url::from_file_path(uri).ok())?;
         let path = self.path_for_uri_or_notebook_cell(&url)?;
         let notebook_cell = self.maybe_get_code_cell_index(&url);
 
-        let (transaction, handle) = self.query_transaction_and_handle(&path);
-        let module_info = transaction.get_module_info(&handle)?;
-        let position =
-            module_info.from_lsp_position(lsp_types::Position { line, character }, notebook_cell);
-        Some((transaction, handle, position))
+        // The config finder picks the config, and so the `SysInfo`, from the
+        // path, so a rebuilt handle matches the one state holds. A bundled stub
+        // is the exception: state holds it under a `bundled_*` `ModulePath`, so
+        // the materialized path the client sends back rebuilds as a separate
+        // filesystem module and the stub is solved twice. Opening one in the
+        // editor already does the same through `ModulePath::memory`.
+        let handle = if self.open_files.read().contains_key(&path) {
+            make_open_handle(&self.state, &path)
+        } else {
+            handle_from_module_path(&self.state, ModulePath::filesystem(path.to_owned()))
+        };
+
+        let (mut transaction, needs_validation) =
+            match ide_transaction_manager.get_possibly_committable_transaction(&self.state) {
+                Ok(mut committable) => {
+                    // Read before validation runs: validation raises open
+                    // files to `Require::Everything`, so checking afterwards
+                    // would see the level it just created.
+                    if committable.as_ref().get_require(&handle) == Some(Require::Everything) {
+                        // Nothing to cache, so the committing lock buys us nothing.
+                        (committable.downgrade(), true)
+                    } else {
+                        let transaction = committable.as_mut();
+                        self.validate_in_memory_for_transaction(transaction, telemetry_event, None);
+                        transaction.run(&[handle.dupe()], Require::Everything, None);
+                        // `commit_transaction_downgrade` holds the state lock
+                        // across the commit, so what it hands back is the state
+                        // validated and solved just above.
+                        (
+                            self.state.commit_transaction_downgrade(
+                                committable,
+                                Some(telemetry_event),
+                                Require::Exports,
+                            ),
+                            false,
+                        )
+                    }
+                }
+                // A recheck holds the committing lock, so there is nothing to
+                // commit into and the solve happens in the read-only transaction.
+                Err(transaction) => (transaction, true),
+            };
+
+        if needs_validation {
+            // `didChange` skips validation when another mutation is already
+            // queued, so the overlay can be behind `open_files` even once the
+            // queue drains.
+            self.validate_in_memory_for_transaction(&mut transaction, telemetry_event, None);
+            transaction.run(&[handle.dupe()], Require::Everything, None);
+        }
+        let result = query(&transaction, &handle, notebook_cell);
+        ide_transaction_manager.save(transaction, telemetry_event);
+        result
     }
 
     /// Convert `ty` to the TSP wire format, resolving every declaration location
@@ -6595,7 +6943,8 @@ impl Server {
                 source_handle.sys_info().dupe(),
             );
             transaction
-                .get_bindings(&handle)?
+                .get_answers(&handle)?
+                .bindings()
                 .function_def_range(func_id.def_index)
         };
         // An importable module's backing filesystem path.
@@ -6761,69 +7110,99 @@ impl TspInterface for Server {
         Ok(paths)
     }
 
-    fn type_at_position(&self, uri: &str, line: u32, character: u32) -> Option<tsp_types::Type> {
-        let (transaction, handle, position) = self.open_at_position(uri, line, character)?;
+    fn type_at_position<'a>(
+        &'a self,
+        ide_transaction_manager: &mut TransactionManager<'a>,
+        telemetry_event: &mut TelemetryEvent,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Option<tsp_types::Type> {
         // For TSP, return the raw declared type without coercing callees in
         // call position. This keeps the function's `Declaration::Regular`
         // intact on the wire, which TSP clients need to re-resolve the
         // signature (parameters, overloads) from source.
-        let ty = transaction.get_type_at_preserving_declaration(&handle, position)?;
-        Some(self.convert_type_in_transaction(&transaction, &handle, &ty))
+        self.with_query_transaction(
+            ide_transaction_manager,
+            telemetry_event,
+            uri,
+            |transaction, handle, notebook_cell| {
+                let module_info = transaction.get_module_info(handle)?;
+                let position = module_info
+                    .from_lsp_position(lsp_types::Position { line, character }, notebook_cell);
+                let ty = transaction.get_type_at_preserving_declaration(handle, position)?;
+                Some(self.convert_type_in_transaction(transaction, handle, &ty))
+            },
+        )
     }
 
-    fn computed_type_at_range(
-        &self,
+    fn computed_type_at_range<'a>(
+        &'a self,
+        ide_transaction_manager: &mut TransactionManager<'a>,
+        telemetry_event: &mut TelemetryEvent,
         uri: &str,
         start_line: u32,
         start_character: u32,
         end_line: u32,
         end_character: u32,
     ) -> Option<tsp_types::Type> {
-        let url = Url::parse(uri)
-            .ok()
-            .or_else(|| Url::from_file_path(uri).ok())?;
-        let path = self.path_for_uri_or_notebook_cell(&url)?;
-        let notebook_cell = self.maybe_get_code_cell_index(&url);
-
-        let (transaction, handle) = self.query_transaction_and_handle(&path);
-        let module_info = transaction.get_module_info(&handle)?;
-        let start = module_info.from_lsp_position(
-            lsp_types::Position {
-                line: start_line,
-                character: start_character,
+        self.with_query_transaction(
+            ide_transaction_manager,
+            telemetry_event,
+            uri,
+            |transaction, handle, notebook_cell| {
+                let module_info = transaction.get_module_info(handle)?;
+                let start = module_info.from_lsp_position(
+                    lsp_types::Position {
+                        line: start_line,
+                        character: start_character,
+                    },
+                    notebook_cell,
+                );
+                let end = module_info.from_lsp_position(
+                    lsp_types::Position {
+                        line: end_line,
+                        character: end_character,
+                    },
+                    notebook_cell,
+                );
+                let range = TextRange::new(start, end);
+                // Range-aware lookup: a whole call-expression range resolves to the
+                // call's result type, other ranges to the declaration-preserving
+                // type. Convert against the *same* transaction that produced `ty`,
+                // so export location resolution stays warm and cannot hit a cold
+                // `get_stdlib`.
+                let ty = transaction.get_computed_type_at_range(handle, range)?;
+                Some(self.convert_type_in_transaction(transaction, handle, &ty))
             },
-            notebook_cell,
-        );
-        let end = module_info.from_lsp_position(
-            lsp_types::Position {
-                line: end_line,
-                character: end_character,
-            },
-            notebook_cell,
-        );
-        let range = TextRange::new(start, end);
-        // Range-aware lookup: a whole call-expression range resolves to the
-        // call's result type, other ranges to the declaration-preserving type.
-        // Convert against the *same* transaction that produced `ty`, so export
-        // location resolution stays warm and cannot hit a cold `get_stdlib`.
-        let ty = transaction.get_computed_type_at_range(&handle, range)?;
-        Some(self.convert_type_in_transaction(&transaction, &handle, &ty))
+        )
     }
 
-    fn expected_type_at_position(
-        &self,
+    fn expected_type_at_position<'a>(
+        &'a self,
+        ide_transaction_manager: &mut TransactionManager<'a>,
+        telemetry_event: &mut TelemetryEvent,
         uri: &str,
         line: u32,
         character: u32,
     ) -> Option<tsp_types::Type> {
-        let (transaction, handle, position) = self.open_at_position(uri, line, character)?;
         // Prefer the contextually expected type; fall back to the computed type
         // (preserving declarations) so the result is meaningful even outside an
         // expected-type context.
-        let ty = transaction
-            .get_expected_type_at(&handle, position)
-            .or_else(|| transaction.get_type_at_preserving_declaration(&handle, position))?;
-        Some(self.convert_type_in_transaction(&transaction, &handle, &ty))
+        self.with_query_transaction(
+            ide_transaction_manager,
+            telemetry_event,
+            uri,
+            |transaction, handle, notebook_cell| {
+                let module_info = transaction.get_module_info(handle)?;
+                let position = module_info
+                    .from_lsp_position(lsp_types::Position { line, character }, notebook_cell);
+                let ty = transaction
+                    .get_expected_type_at(handle, position)
+                    .or_else(|| transaction.get_type_at_preserving_declaration(handle, position))?;
+                Some(self.convert_type_in_transaction(transaction, handle, &ty))
+            },
+        )
     }
 
     fn resolve_uri_to_path(&self, uri: &Url) -> Option<PathBuf> {

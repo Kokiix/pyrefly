@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::Parser;
 use pyrefly_python::ignore::Tool;
+use pyrefly_python::ignore::TypeIgnoreUnknownTagBehavior;
 use pyrefly_python::sys_info::PythonPlatform;
 use pyrefly_python::sys_info::PythonVersion;
 use pyrefly_util::absolutize::Absolutize as _;
@@ -278,6 +279,9 @@ pub struct ConfigOverrideArgs {
     /// related import errors.
     #[arg(long)]
     ignore_missing_imports: Option<Vec<String>>,
+    /// Replace specified third-party imports with typing.Any when no stubs or py.typed marker exist.
+    #[arg(long)]
+    replace_untyped_imports_with_any: Option<Vec<String>>,
     /// Whether to ignore type errors in generated code.
     #[arg(
         long,
@@ -297,14 +301,6 @@ pub struct ConfigOverrideArgs {
         num_args = 0..=1
     )]
     infer_with_first_use: Option<bool>,
-    /// Check every match statement for exhaustiveness instead of limiting checks to closed subject types.
-    #[arg(
-        long,
-        default_missing_value = "true",
-        require_equals = true,
-        num_args = 0..=1
-    )]
-    check_all_matches: Option<bool>,
     /// Whether to respect ignore files (.gitignore, .ignore, .git/exclude).
     #[arg(
         long,
@@ -344,6 +340,9 @@ pub struct ConfigOverrideArgs {
     /// Defaults to type,pyrefly. Passing the names of all tools is equivalent to `--permissive-ignores`.
     #[arg(long, value_delimiter = ',')]
     enabled_ignores: Option<Vec<Tool>>,
+    /// How `# type: ignore[...]` comments with non-Pyrefly tags affect diagnostics.
+    #[arg(long)]
+    type_ignore_unknown_tag_behavior: Option<TypeIgnoreUnknownTagBehavior>,
     /// Force this rule to emit an error. Can be passed multiple times or as a comma-separated list.
     #[arg(long, hide_possible_values = true, value_delimiter = ',')]
     error: Vec<ErrorKind>,
@@ -428,15 +427,16 @@ impl ConfigOverrideArgs {
             environment,
             replace_imports_with_any,
             ignore_missing_imports,
+            replace_untyped_imports_with_any,
             ignore_errors_in_generated_code,
             infer_with_first_use,
-            check_all_matches,
             use_ignore_files,
             untyped_def_behavior,
             check_unannotated_defs,
             infer_return_types,
             permissive_ignores,
             enabled_ignores,
+            type_ignore_unknown_tag_behavior,
             error,
             warn,
             ignore,
@@ -455,15 +455,16 @@ impl ConfigOverrideArgs {
         environment.has_overrides()
             || replace_imports_with_any.is_some()
             || ignore_missing_imports.is_some()
+            || replace_untyped_imports_with_any.is_some()
             || ignore_errors_in_generated_code.is_some()
             || infer_with_first_use.is_some()
-            || check_all_matches.is_some()
             || use_ignore_files.is_some()
             || untyped_def_behavior.is_some()
             || check_unannotated_defs.is_some()
             || infer_return_types.is_some()
             || permissive_ignores.is_some()
             || enabled_ignores.is_some()
+            || type_ignore_unknown_tag_behavior.is_some()
             || !error.is_empty()
             || !warn.is_empty()
             || !ignore.is_empty()
@@ -595,6 +596,9 @@ impl ConfigOverrideArgs {
                 }
             }
         }
+        if let Some(x) = self.type_ignore_unknown_tag_behavior {
+            config.root.type_ignore_unknown_tag_behavior = Some(x);
+        }
         if let Some(wildcards) = &self.replace_imports_with_any {
             config.root.replace_imports_with_any = Some(
                 wildcards
@@ -611,14 +615,19 @@ impl ConfigOverrideArgs {
                     .collect(),
             );
         }
+        if let Some(wildcards) = &self.replace_untyped_imports_with_any {
+            config.root.replace_untyped_imports_with_any = Some(
+                wildcards
+                    .iter()
+                    .filter_map(|x| ModuleWildcard::new(x).ok())
+                    .collect(),
+            );
+        }
         if let Some(x) = &self.ignore_errors_in_generated_code {
             config.root.ignore_errors_in_generated_code = Some(*x);
         }
         if let Some(x) = &self.infer_with_first_use {
             config.root.infer_with_first_use = Some(*x);
-        }
-        if let Some(x) = &self.check_all_matches {
-            config.root.check_all_matches = Some(*x);
         }
         if let Some(x) = &self.recursion_depth_limit {
             config.root.recursion_depth_limit = Some(*x);
@@ -713,6 +722,7 @@ mod tests {
     fn repeated_python_platform_flags_merge() {
         let args = ConfigOverrideArgs::parse_from([
             "pyrefly",
+            "--skip-interpreter-query", // To avoid calling a Python binary in the test
             "--python-platform",
             "linux",
             "--python-platform",
@@ -734,6 +744,7 @@ mod tests {
     fn repeated_python_platform_flags_all_wins() {
         let args = ConfigOverrideArgs::parse_from([
             "pyrefly",
+            "--skip-interpreter-query", // To avoid calling a Python binary in the test
             "--python-platform",
             "all",
             "--python-platform",

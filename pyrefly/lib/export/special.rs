@@ -21,6 +21,7 @@ pub enum SpecialExport {
     TypeVar,
     IntVar,
     Flag,
+    Index,
     ParamSpec,
     TypeVarTuple,
     Annotated,
@@ -42,6 +43,7 @@ pub enum SpecialExport {
     Quit,
     OsExit,
     Len,
+    Range,
     Bool,
     BuiltinsType,
     TypingType,
@@ -82,6 +84,7 @@ pub enum SpecialExport {
     TypeShapeDslFunction,
     MapIntTuples,
     ShapedArray,
+    StaticJaxtyping,
     ProxyMethod,
     Sentinel,
     BuiltinsSentinel,
@@ -99,6 +102,7 @@ impl SpecialExport {
             "TypeVar" => Some(Self::TypeVar),
             "IntVar" => Some(Self::IntVar),
             "Flag" => Some(Self::Flag),
+            "Index" => Some(Self::Index),
             "ParamSpec" => Some(Self::ParamSpec),
             "TypeVarTuple" => Some(Self::TypeVarTuple),
             "Annotated" => Some(Self::Annotated),
@@ -122,6 +126,7 @@ impl SpecialExport {
             "quit" => Some(Self::Quit),
             "_exit" => Some(Self::OsExit),
             "len" => Some(Self::Len),
+            "range" => Some(Self::Range),
             "bool" => Some(Self::Bool),
             "type" => Some(Self::BuiltinsType),
             "Type" => Some(Self::TypingType),
@@ -161,6 +166,7 @@ impl SpecialExport {
             "type_shape_dsl_function" => Some(Self::TypeShapeDslFunction),
             "MapIntTuples" => Some(Self::MapIntTuples),
             "shaped_array" => Some(Self::ShapedArray),
+            "static_jaxtyping" => Some(Self::StaticJaxtyping),
             "ProxyMethod" => Some(Self::ProxyMethod),
             "Sentinel" => Some(Self::Sentinel),
             "sentinel" => Some(Self::BuiltinsSentinel),
@@ -173,7 +179,7 @@ impl SpecialExport {
 
     pub fn defined_in(self, m: ModuleName) -> bool {
         match self {
-            Self::IntVar | Self::Flag | Self::MapIntTuples => {
+            Self::IntVar | Self::Flag | Self::Index | Self::MapIntTuples => {
                 matches!(m.as_str(), "shape_extensions")
             }
             Self::TypeVar => matches!(m.as_str(), "typing" | "typing_extensions"),
@@ -214,6 +220,7 @@ impl SpecialExport {
             Self::Enum | Self::StrEnum | Self::IntEnum => matches!(m.as_str(), "enum"),
             Self::Super
             | Self::Len
+            | Self::Range
             | Self::Quit
             | Self::Bool
             | Self::BuiltinsType
@@ -250,6 +257,7 @@ impl SpecialExport {
             Self::ShapeDslFunction => matches!(m.as_str(), "shape_extensions.dsl"),
             Self::TypeShapeDslFunction => matches!(m.as_str(), "shape_extensions"),
             Self::ShapedArray => matches!(m.as_str(), "shape_extensions"),
+            Self::StaticJaxtyping => matches!(m.as_str(), "shape_extensions"),
             Self::ProxyMethod => matches!(m.as_str(), "shape_extensions"),
             Self::Sentinel => matches!(m.as_str(), "typing_extensions"),
             // `builtins.sentinel` (3.15+) and its `typing_extensions.sentinel`

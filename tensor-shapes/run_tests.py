@@ -4,7 +4,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Run every tensor-shape stub test: static and runtime, for every library.
+"""Run every tensor-shape static and runtime test suite.
 
 This is the single entry point CI uses, internally and on GitHub, so that all
 of the shape coverage lands in one job rather than one job per library. The
@@ -12,10 +12,8 @@ per-package `run_pyrefly.py` and `run_runtime_tests.py` remain the things to
 reach for while iterating on a single library.
 
 Builds Pyrefly before checking, and needs the shared virtualenv from
-bootstrap_venv.py for the runtime half. `--static-only` drops the virtualenv
-requirement entirely,
-which is the usual mode when changing Pyrefly rather than the stubs. Nothing
-here downloads anything.
+bootstrap_venv.py for runtime tests and static fallback checks. Nothing here
+downloads anything.
 """
 
 from __future__ import annotations
@@ -28,10 +26,43 @@ from pathlib import Path
 from shape_testing import pyrefly_command, TENSOR_SHAPES_ROOT, venv_python
 
 PACKAGES: tuple[str, ...] = (
+    "microtorch",
     "pyrefly-torch-stubs",
     "pyrefly-numpy-stubs",
     "pyrefly-jax-stubs",
+    "pyrefly-einops-stubs",
 )
+
+RUNTIME_PACKAGES: frozenset[str] = frozenset(
+    {
+        "pyrefly-torch-stubs",
+        "pyrefly-numpy-stubs",
+        "pyrefly-jax-stubs",
+        "pyrefly-einops-stubs",
+    }
+)
+
+
+def shaped_array_reference_lines(source: str) -> list[int]:
+    return [
+        line_number
+        for line_number, line in enumerate(source.splitlines(), start=1)
+        if "shaped_array" in line
+    ]
+
+
+def shaped_array_references() -> list[str]:
+    uses = []
+    for package in PACKAGES:
+        package_root = TENSOR_SHAPES_ROOT / package
+        for path in package_root.rglob("*"):
+            if path.suffix not in {".py", ".pyi"}:
+                continue
+            uses.extend(
+                f"{path.relative_to(TENSOR_SHAPES_ROOT)}:{line}"
+                for line in shaped_array_reference_lines(path.read_text())
+            )
+    return uses
 
 
 def main() -> int:
@@ -56,12 +87,15 @@ def main() -> int:
         "--python",
         type=Path,
         default=None,
-        help="interpreter with torch/numpy/jax installed (default: the shared virtualenv)",
+        help=(
+            "virtualenv interpreter used by runtime tests and static fallback "
+            "(default: shared virtualenv)"
+        ),
     )
     parser.add_argument(
         "--static-only",
         action="store_true",
-        help="only type check; needs no virtualenv",
+        help="only type check; still needs the virtualenv for static fallback",
     )
     parser.add_argument(
         "--runtime-only",
@@ -73,6 +107,12 @@ def main() -> int:
 
     if args.static_only and args.runtime_only:
         raise SystemExit("--static-only and --runtime-only are mutually exclusive")
+    if references := shaped_array_references():
+        print(
+            "Legacy shaped_array references remain:\n" + "\n".join(references),
+            file=sys.stderr,
+        )
+        return 1
 
     # Resolve both toolchains before running anything, so a missing virtualenv
     # fails immediately rather than after several minutes of type checking.
@@ -83,18 +123,7 @@ def main() -> int:
             explicit=args.pyrefly, buck=args.buck, release=args.release
         )
     )
-    python = (
-        None
-        if args.static_only
-        else venv_python(
-            args.python,
-            extra_hint=(
-                "Pass --static-only to run just the type checking, which needs no\n"
-                "virtualenv. That is usually the right mode when working on Pyrefly\n"
-                "itself rather than on the stubs, since CI runs the runtime tests.\n\n"
-            ),
-        )
-    )
+    python = venv_python(args.python)
 
     failures: list[str] = []
     for package in PACKAGES:
@@ -104,7 +133,7 @@ def main() -> int:
             print(f"\n=== {step} ===", flush=True)
             command = [sys.executable, str(package_root / "run_pyrefly.py")]
             # Forward the already-resolved binary rather than re-passing the
-            # flags, so that the three packages share one build. `--pyrefly`,
+            # flags, so that the packages share one build. `--pyrefly`,
             # $PYREFLY and $CARGO_TARGET_DIR may all be relative to this
             # process's directory, and the child runs from a different one. A
             # single-element command is a binary path; anything longer is the
@@ -113,11 +142,13 @@ def main() -> int:
                 command.extend(["--pyrefly", pyrefly[0]])
             else:
                 command.append("--buck")
+            if package != "microtorch":
+                command.extend(["--python", str(python)])
             if args.nocapture:
                 command.append("--nocapture")
             if not run(command):
                 failures.append(step)
-        if python is not None:
+        if not args.static_only and package in RUNTIME_PACKAGES:
             step = f"{package} runtime"
             print(f"\n=== {step} ===", flush=True)
             if not run([str(python), str(package_root / "run_runtime_tests.py")]):
