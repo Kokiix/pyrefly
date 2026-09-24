@@ -2502,6 +2502,45 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         );
     }
 
+    pub fn check_except_handler_reachability(
+        &self,
+        current_except: &Idx<Key>,
+        prev_excepts: &Vec<Idx<Key>>,
+        range: &TextRange,
+        errors: &ErrorCollector
+    ) {
+        if prev_excepts.is_empty() { return; }
+        let curr_except_type = self.get_idx(*current_except).ty().clone();
+        let prev_except_types = self.unions(
+            prev_excepts.iter().map(|idx| self.get_idx(*idx).ty().clone()).collect()
+        );
+
+        // Don't claim a handler is unreachable when either side is imprecise.
+        if self.behaves_like_any(&curr_except_type) || self.behaves_like_any(&prev_except_types) {
+            return;
+        }
+
+        // A handler can catch a union (including a tuple of exception classes).
+        // Every current alternative must be covered by the earlier handlers.
+        let current_members = match &curr_except_type {
+            Type::Union(union) => union.members.as_slice(),
+            _ => std::slice::from_ref(&curr_except_type),
+        };
+        if current_members
+            .iter()
+            .all(|caught| self.is_subset_eq(caught, &prev_except_types))
+        {
+            self.error(
+                errors,
+                *range,
+                ErrorKind::UnreachableExceptHandler,
+                "Unreachable exception handler"
+                    .to_owned(),
+            );
+        }
+
+    }
+
     /// Check whether we can reliably determine reachability for this op.
     ///
     /// Returns `true` only when we understand all sub-ops AND at least one
