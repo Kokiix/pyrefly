@@ -2685,6 +2685,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 case_range,
                 errors,
             ),
+            BindingExpect::ExceptHandlerReachability {
+                current_except,
+                prev_excepts,
+                range
+            } => self.check_except_handler_reachability(
+                current_except,
+                prev_excepts,
+                range,
+                errors
+            ),
             BindingExpect::WithFallthroughReachability {
                 contexts,
                 kind,
