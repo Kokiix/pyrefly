@@ -3046,3 +3046,16 @@ def f(x: T) -> T:  # E: not in scope  # E: not in scope
     return x
     "#,
 );
+
+testcase!(
+    test_unreachable_except,
+    r#"
+def f():
+    try:
+        pass
+    except BaseException:
+        pass
+    except Exception: # E: Unreachable exception handler
+        pass
+    "#,
+);

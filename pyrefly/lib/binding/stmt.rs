@@ -33,6 +33,7 @@ use starlark_map::small_set::SmallSet;
 
 use crate::binding::binding::AnnAssignHasValue;
 use crate::binding::binding::AnnotationTarget;
+// use crate::binding::binding::AnyIdx::KeyExpect;
 use crate::binding::binding::Binding;
 use crate::binding::binding::BindingAnnotation;
 use crate::binding::binding::BindingExpect;
@@ -1618,6 +1619,7 @@ impl<'a> BindingsBuilder<'a> {
                 self.stmts(x.orelse, parent);
                 self.finish_branch();
 
+                let mut seen_exceptions: Vec<Idx<Key>> = Vec::new();
                 for h in x.handlers {
                     self.start_branch();
                     let range = h.range();
@@ -1636,11 +1638,21 @@ impl<'a> BindingsBuilder<'a> {
                         }
                         (None, Some(mut type_)) => {
                             let mut handler = self.declare_current_idx(Key::Anon(range));
+                            let handler_idx = handler.idx();
                             self.ensure_expr(&mut type_, handler.usage());
                             self.insert_binding_current(
                                 handler,
                                 Binding::ExceptionHandler(type_, x.is_star),
                             );
+                            self.insert_binding(
+                                KeyExpect::ExceptHandlerReachability(h.range),
+                                BindingExpect::ExceptHandlerReachability {
+                                    current_except: handler_idx,
+                                    prev_excepts: seen_exceptions.clone(),
+                                    range: h.range,
+                                }
+                            );
+                            seen_exceptions.push(handler_idx);
                         }
                         (Some(name), None) => {
                             // Must be a syntax error. But make sure we bind name to something.
